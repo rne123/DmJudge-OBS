@@ -1,0 +1,318 @@
+"""키 입력 ↔ 노트 도달 매칭, 통계, 추천 판정값 계산 (플랫폼 독립)."""
+from __future__ import annotations
+
+from collections import defaultdict, deque
+
+import numpy as np
+
+
+class Matcher:
+    """채널별로 '눌린 시각'과 '노트 중앙이 판정선 정중앙에 닿은 시각'을 짝짓는다.
+
+    e = t_press - t_arrival  (ms, 화면 기준. 음수 = 빨리 침)
+    도달 이벤트는 실시간으로 들어오므로, t_arrival + window 가 지난 뒤에 확정한다.
+    """
+
+    def __init__(self, window_ms=100.0, chatter_ms=25.0, early_ms=None):
+        self.W = window_ms                  # 늦게 친 쪽 최대 거리
+        self.WE = window_ms if early_ms is None else early_ms   # 일찍 친 쪽 최대 거리 (게임은 빠른 쪽을 더 넓게 받음)
+        # 짝짓기 중심: 화면 도달 시각 + center (= 실제 판정 중심).
+        # 판정 타이밍을 +N 으로 올리면 보이지 않는 판정선이 N ms 위에 있으므로 center = -(N + 보정값)
+        self.center = 0.0
+        self.fast_win = 42.0
+        self.fs = 42.0                      # FAST/SLOW 범위 (판정 기준 ±ms)
+        self.events = []                    # ("fast"/"slow", ch, 발생 시각, 오차)
+        self.provisional = {}               # 확정 대기 중인 늦은 입력 (인디케이터 즉시 표시용)
+        self.chatter_ms = chatter_ms
+        self.presses = defaultdict(list)    # ch -> [t, used, chatter]
+        self.arrivals = defaultdict(list)   # ch -> [t, conf, long]
+        self.hits = []                      # (t_arr, ch, e, conf)
+        self.missed = defaultdict(int)
+        self.phantom = 0                    # 가짜 도달(전환 화면 등)로 걸러낸 수
+        self._ph_t = []                     # 가짜 묶음이 나온 시각
+        self.ghost = defaultdict(int)
+        self.chatter = defaultdict(int)     # key_id -> 횟수
+        self._last_up = {}
+        self._down = {}
+        self._any_press = deque(maxlen=64)  # 레인 상관없이 최근 누른 시각 (아무것도 안 누른 구간의 '놓침'은 세지 않음)
+
+    def on_key(self, key_id, is_down, t, ch):
+        if is_down:
+            ch_ = ch
+            lu = self._last_up.get(key_id)
+            chat = lu is not None and (t - lu) < self.chatter_ms
+            if chat:
+                self.chatter[key_id] += 1
+            if ch_ is not None:
+                self.presses[ch_].append([t, False, chat])
+                self._any_press.append(t)
+        else:
+            self._last_up[key_id] = t
+
+    PHANTOM_MS = 25.0      # 같은 레인에 이보다 가깝게 붙은 도달은 노트가 아님 (실제 채보 최소 간격은 40ms 이상)
+    PHANTOM_SPAN = 300.0
+
+    def on_arrival(self, ch, t, conf, is_long, nid=None):
+        arr = self.arrivals[ch]
+        # 곡 시작·전환 화면의 번쩍임/와이프는 같은 레인에 몇 ms 간격으로 '도달'을 줄줄이 만든다
+        # → 서로 붙어 있는 것끼리 전부 가짜로 표시 (짝짓기·놓침 집계에서 빠짐).
+        # 그런 묶음이 나온 앞뒤 PHANTOM_SPAN ms 안의 다른 레인 도달도 같은 화면 효과로 보고 뺀다.
+        fake = any(abs(pt - t) < self.PHANTOM_SPAN for pt in self._ph_t[-8:])
+        for a in arr[-6:]:
+            if abs(a[0] - t) < self.PHANTOM_MS:
+                a[1] = -1.0
+                fake = True
+                self._ph_t.append(t)
+        if fake:
+            sp = self.PHANTOM_SPAN
+            for lst in self.arrivals.values():
+                for a in lst[-12:]:
+                    if a[1] >= 0 and abs(a[0] - t) < sp:
+                        a[1] = -1.0
+                        self.phantom += 1
+            self.phantom += 1
+            conf = -1.0
+        arr.append([t, conf, is_long, False, nid])   # [3] = SLOW 조기 확정 여부, [4] = 노트 번호
+
+    def resolve(self, now):
+        """now 시각까지 확정할 수 있는 노트를 확정한다.
+        - 입력이 있으면: 앞으로 올 어떤 입력도 이보다 가까울 수 없게 된 순간 바로 확정
+          (빠르게 친 노트, 범위 안 노트는 즉시 / 범위 밖 늦은 입력은 창이 끝날 때)
+        - 판정 중심 + FAST/SLOW 범위가 지났는데 아직 입력이 없으면: 그 순간 SLOW 확정 이벤트
+        """
+        W = self.W
+        WE = self.WE
+        fs = self.fs
+        c = self.center
+        for ch in list(self.arrivals.keys()):
+            arr = self.arrivals[ch]
+            prs = self.presses.get(ch, [])
+            done = 0
+            for i, a in enumerate(arr):
+                ta, conf = a[0], a[1]
+                if conf < 0:                     # 가짜 도달: 버림
+                    self.provisional.pop(id(a), None)
+                    done = i + 1
+                    continue
+                tc = ta + c                      # 이 노트의 판정 중심 시각
+                best, bd = None, W + 1
+                for p in prs:
+                    if p[1] or p[0] > now or p[0] - tc > W or tc - p[0] > WE:
+                        continue
+                    d = abs(p[0] - tc)
+                    # 다음 노트에 더 가까운 입력은 이 노트 것이 아님
+                    if any(b[1] >= 0 and abs(p[0] - (b[0] + c)) < d for b in arr[i + 1:i + 4]):
+                        continue
+                    # 게임처럼 '창 안에서 먼저 누른 입력'이 이 노트의 판정 (더 가까운 나중 입력이 아니라)
+                    if best is None or p[0] < best[0]:
+                        best, bd = p, d
+                if best is not None:
+                    dd = best[0] - tc
+                    sure = True                  # 먼저 누른 입력이 정해졌으면 더 기다릴 것 없음
+                    if sure or now >= tc + W:
+                        best[1] = True
+                        self.provisional.pop(id(a), None)
+                        self.hits.append((ta, ch, best[0] - ta, conf, a[4]))
+                        if conf >= 1.0:
+                            if dd < -fs:
+                                self.events.append(("fast", ch, now, dd, a[4]))
+                            elif dd > fs and not a[3]:
+                                self.events.append(("slow", ch, now, dd, a[4]))
+                        done = i + 1
+                        continue
+                    # 늦게 친 입력: 통계 확정은 창 끝까지 기다리지만, 인디케이터에는 지금 바로 찍는다
+                    self.provisional[id(a)] = (ta, ch, best[0] - ta, conf, a[4])
+                if now >= tc + W:
+                    self.provisional.pop(id(a), None)
+                    # 앞뒤로 키를 하나도 안 누르던 구간(곡 시작 전 화면, 데모 재생 등)은 놓침으로 안 셈
+                    if conf >= 1.0 and any(abs(p - ta) < 1500.0 for p in self._any_press):
+                        self.missed[ch] += 1
+                    done = i + 1
+                    continue
+                break
+            if done:
+                del arr[:done]
+            # 오래된 입력 정리
+            keep = []
+            for p in prs:
+                if now - p[0] > 3 * max(W, WE):
+                    if not p[1]:
+                        self.ghost[ch] += 1
+                    continue
+                keep.append(p)
+            if ch in self.presses:
+                self.presses[ch] = keep
+
+    def reset(self):
+        c, fw, fs = self.center, self.fast_win, self.fs
+        self.__init__(self.W, self.chatter_ms, self.WE)
+        self.center, self.fast_win, self.fs = c, fw, fs
+
+
+def summarize(e: np.ndarray, judge_setting: float, win: float, bias: float = 0.0, fs: float = 0.0,
+              rec: bool = True):
+    """e: 화면 기준 오차(ms) 배열. 반환: 통계 dict"""
+    n = len(e)
+    if n == 0:
+        return {"n": 0}
+    j = e + judge_setting + bias          # 판정 기준 오차
+    med = float(np.median(e))
+    mad = float(np.median(np.abs(e - med)) * 1.4826)
+    res = {
+        "n": n,
+        "mean_e": float(e.mean()),
+        "median_e": med,
+        "std": float(e.std()),
+        "robust_std": mad,
+        "mean_j": float(j.mean()),
+        "median_j": float(np.median(j)),
+        "fast": int((j < -fs).sum()),        # FAST/SLOW 기준(±fs ms) 밖
+        "slow": int((j > fs).sum()),
+        "in_now": float((np.abs(j) <= win).mean()),
+        "early_now": int((j < -win).sum()),
+        "late_now": int((j > win).sum()),
+    }
+    if rec:
+        # 계산량 제한: 최근 3000개로 추천값 계산 (화면 반응이 끊기지 않게)
+        res.update(recommend(e[-3000:], win, bias))
+    return res
+
+
+def recommend(e: np.ndarray, win: float, bias: float = 0.0, lo=-120, hi=120):
+    """±win 안에 들어오는 노트 수가 최대가 되는 판정 타이밍 값(정수 ms)."""
+    if len(e) == 0:
+        return {}
+    ss = np.arange(lo, hi + 1)
+    je = e[None, :] + ss[:, None] + bias
+    cnt = (np.abs(je) <= win).sum(1)
+    mx = cnt.max()
+    plateau = ss[cnt == mx]
+    # 최대 구간이 여러 개면 중앙값 기준점에 가장 가까운 구간의 가운데
+    center = -(np.median(e) + bias)
+    groups = np.split(plateau, np.where(np.diff(plateau) > 1)[0] + 1)
+    g = min(groups, key=lambda gg: abs((gg[0] + gg[-1]) / 2 - center))
+    s_best = int(round((g[0] + g[-1]) / 2))
+    margin_lo = win - (-(e + s_best + bias).min())   # 가장 빠른 노트까지 남은 여유
+    margin_hi = win - (e + s_best + bias).max()
+    return {
+        "best_setting": s_best,
+        "in_best": float(mx / len(e)),
+        "margin_early": float(margin_lo),
+        "margin_late": float(margin_hi),
+    }
+
+
+def histogram(values, lo=-100, hi=100, step=4):
+    edges = np.arange(lo, hi + step, step)
+    h, _ = np.histogram(np.clip(values, lo, hi - 1e-6), bins=edges)
+    return edges, h
+
+
+def calibrate_from_game(e: np.ndarray, judge_setting: float, win: float, n_fast: int, n_slow: int):
+    """게임 결과(100% 밖 FAST 개수, SLOW 개수)와 가장 잘 맞는 보정값(ms)을 찾는다.
+    반환: (보정값, 그때의 FAST 밖 개수, SLOW 밖 개수)"""
+    if len(e) == 0:
+        return None
+    bs = np.arange(-80, 80.01, 0.5)
+    j = e[None, :] + judge_setting + bs[:, None]
+    ce = (j < -win).sum(1)
+    cl = (j > win).sum(1)
+    cost = np.abs(ce - n_fast) + np.abs(cl - n_slow)
+    best = bs[cost == cost.min()]
+    groups = np.split(best, np.where(np.diff(best) > 0.51)[0] + 1)
+    g = max(groups, key=len)
+    b = float((g[0] + g[-1]) / 2)
+    k = int(np.argmin(np.abs(bs - b)))
+    return b, int(ce[k]), int(cl[k])
+
+
+def calibrate_from_total(e: np.ndarray, judge_setting: float, win: float, n_out: int, lo=-40.0, hi=40.0):
+    """게임 결과 화면의 'MAX 100%가 아닌 노트 수'(MAX 90% 이하 합계, BREAK 제외)와 맞는 보정값.
+    디맥 결과 화면은 FAST/SLOW를 나눠 보여주지 않으므로 합계만으로 찾는다.
+    개수가 맞는 구간이 여러 개면 0에 가장 가까운 구간의 가운데. 반환: (보정값, FAST 밖, SLOW 밖, 구간 폭)"""
+    if len(e) == 0:
+        return None
+    bs = np.arange(lo, hi + 0.01, 0.5)
+    j = e[None, :] + judge_setting + bs[:, None]
+    ce = (j < -win).sum(1)
+    cl = (j > win).sum(1)
+    cost = np.abs(ce + cl - n_out)
+    best = bs[cost == cost.min()]
+    groups = np.split(best, np.where(np.diff(best) > 0.51)[0] + 1)
+    g = min(groups, key=lambda g: (abs((g[0] + g[-1]) / 2), -len(g)))
+    b = float((g[0] + g[-1]) / 2)
+    k = int(np.argmin(np.abs(bs - b)))
+    return b, int(ce[k]), int(cl[k]), float(g[-1] - g[0])
+
+
+def calibrate_joint(songs, win: float, lo=-40.0, hi=40.0):
+    """여러 곡의 (화면 기준 오차 배열, 판정 타이밍, 게임의 100% 아닌 개수)로 한 번에 보정값 찾기.
+    곡마다 '분석기 기준 범위 밖 개수'와 게임 숫자의 차이 합이 가장 작은 값.
+    반환: (보정값, 맞는 구간 시작, 끝, 차이 합) 또는 None"""
+    songs = [s for s in songs if len(s[0])]
+    if not songs:
+        return None
+    bs = np.arange(lo, hi + 0.01, 0.5)
+    cost = np.zeros(len(bs))
+    for e, js, n in songs:
+        j = np.asarray(e)[None, :] + float(js) + bs[:, None]
+        cost += np.abs(((j < -win) | (j > win)).sum(1) - int(n))
+    best = bs[cost == cost.min()]
+    groups = np.split(best, np.where(np.diff(best) > 0.51)[0] + 1)
+    g = min(groups, key=lambda g: (abs((g[0] + g[-1]) / 2), -len(g)))
+    return float((g[0] + g[-1]) / 2), float(g[0]), float(g[-1]), int(cost.min())
+
+
+def suggest_zero(j_raw: np.ndarray, labels: np.ndarray, win: float, w_label: float = 3.0, lo=-40.0, hi=40.0):
+    """게임 FAST/SLOW 글자와 가장 잘 맞는 영점 보정값 (추천용, 자동 적용하지 않음).
+    j_raw: 보정 전 판정 기준 오차, labels: -1(게임 FAST) / +1(게임 SLOW) / 0(글자 없음)"""
+    if len(j_raw) == 0 or not (labels != 0).any():
+        return None
+    bs = np.arange(lo, hi + 0.01, 0.5)
+    J = j_raw[None, :] + bs[:, None]
+    L = labels[None, :]
+    agree = np.where(L > 0, (J > win) * w_label, np.where(L < 0, (J < -win) * w_label, (np.abs(J) <= win) * 1.0))
+    sc = agree.sum(1)
+    best = bs[sc >= sc.max() - 1e-9]
+    groups = np.split(best, np.where(np.diff(best) > 0.51)[0] + 1)
+    g = max(groups, key=len)
+    return float((g[0] + g[-1]) / 2)
+
+
+def fit_zero(songs, win: float = 125.0 / 3.0, sigma: float = 1.5, lo=-30.0, hi=40.0, step=0.05, brk=1e9):
+    """결과 화면 기반 영점 보정 추천.
+    songs: [(e0 배열, 게임의 MAX 100% 아닌 개수(BREAK 제외))] — e0 = 화면 기준 오차 + 판정 타이밍 (보정 전).
+    게임 오차 = e0 + 보정값 이라고 보고, 노트마다 분석기 측정 흔들림(sigma)을 반영해
+    '보정값 K일 때 범위 밖 개수'의 기댓값·분산을 구한 뒤, 모든 곡의 개수가 동시에 나올 확률이 가장 높은 K를 찾는다.
+    (brk: 이보다 큰 오차는 BREAK로 볼 때 쓰는 값. 판정 등급이 1/60초씩 넓어져 MAX 1%가 분석기 짝짓기 범위(-190~+150)보다 넓으므로 기본은 끔)  
+    반환: dict(best, lo, hi(95%), per=[(게임 개수, K=best일 때 예상 개수)]) 또는 None"""
+    from math import erf, sqrt
+    songs = [(np.asarray(e, float), int(n)) for e, n in songs if len(e) >= 50]
+    if not songs:
+        return None
+    ks = np.arange(lo, hi + step / 2, step)
+    _erf = np.vectorize(erf, otypes=[float])     # 경계 근처 노트가 0개일 때도 동작 (v0.3.61 시작 시 오류)
+
+    def phi(x):
+        return 0.5 * (1.0 + _erf(x / sqrt(2.0)))
+
+    LL = np.zeros(len(ks))
+    curves = []
+    for e, n in songs:
+        e = e[np.abs(e) < 300]
+        mu = np.empty(len(ks))
+        var = np.empty(len(ks))
+        # 범위 근처 노트만 계산 (멀리 있는 노트는 확률 0 또는 1)
+        for i, k in enumerate(ks):
+            d = e + k
+            near = np.abs(np.abs(d) - win) < 6 * sigma
+            far_out = (~near) & (np.abs(d) > win) & (np.abs(d) <= brk)
+            P = 1.0 - (phi((win - d[near]) / sigma) - phi((-win - d[near]) / sigma))
+            mu[i] = far_out.sum() + P.sum()
+            var[i] = (P * (1 - P)).sum() + 0.25
+        LL += -0.5 * (n - mu) ** 2 / var - 0.5 * np.log(var)
+        curves.append(mu)
+    i = int(np.argmax(LL))
+    ok = ks[LL >= LL[i] - 1.92]
+    return {"best": float(ks[i]), "lo": float(ok.min()), "hi": float(ok.max()),
+            "per": [(n, float(c[i])) for (e, n), c in zip(songs, curves)]}
