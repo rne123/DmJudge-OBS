@@ -268,6 +268,21 @@ def _run(q, stop_evt, cfg, cmd_q=None):
     # 곡 끝 → 결과 화면 숫자 읽기: 노트(확실한 도달)가 100개 넘게 나온 뒤 1.5초 넘게 끊기면 0.4초마다 전체 화면 확인
     from .result_ocr import read as read_result
     rs = {"n": 0, "last": None, "next": 0.0, "prev": None}
+    # [기록 저장]이 켜져 있으면 확정된 결과 화면 한 장을 메인으로 넘긴다 (곡이 끝난 뒤 한 번, 플레이 중 부하 없음)
+    rec = {"on": bool(cfg.get("record_save", False))}
+
+    def drain_cmds():
+        if cmd_q is None:
+            return
+        try:
+            while True:
+                cmd = cmd_q.get_nowait()
+                if cmd[0] == "dump" and dumper is not None:
+                    dumper.request(cmd[1])
+                elif cmd[0] == "recsave":
+                    rec["on"] = bool(cmd[1])
+        except Exception:
+            pass
 
     def check_result():
         now = time.perf_counter() * 1000.0
@@ -296,7 +311,7 @@ def _run(q, stop_evt, cfg, cmd_q=None):
             rs["prev"] = None
             return
         if vals == rs["prev"]:                  # 숫자가 올라가는 애니메이션이 끝나 두 번 연속 같을 때 확정
-            q.put(("result", vals, now))
+            q.put(("result", vals, now, full if rec["on"] else None))
             rs["n"], rs["prev"] = 0, None
         else:
             rs["prev"] = vals
@@ -320,9 +335,11 @@ def _run(q, stop_evt, cfg, cmd_q=None):
             t = t0 * 1000.0 + bias
         got = False
         gate = jwatch.ended          # 곡이 끝나 판정선이 없는 동안: 화면에 잡히는 것은 노트로 치지 않음 (결과 화면 전환 그림 등)
+        n_gated = 0                  # 그동안 버린 확실한 도달 수 (꾸준히 나오면 곡이 다시 시작된 것으로 봄)
         for lanes, tr in trackers.items():
             evs = tr.update(frame, t)
             if gate:
+                n_gated = max(n_gated, sum(1 for e_ in evs if e_[2] >= 1))
                 continue
             for (ch, ta, conf, is_long), nid in zip(evs, tr.last_ids):
                 q.put(("arr", lanes, ch, ta, conf, bool(is_long), nid))
@@ -344,7 +361,7 @@ def _run(q, stop_evt, cfg, cmd_q=None):
         try:
             tr0_ = next(iter(trackers.values()))
             covered = jwatch.cover_from(getattr(tr0_, "last_blobs", ()), t)
-            jev = jwatch.feed(frame, t, got, covered)
+            jev = jwatch.feed(frame, t, got, covered, n_gated)
         except Exception:
             jev = None
         if jev == "end":
@@ -358,13 +375,7 @@ def _run(q, stop_evt, cfg, cmd_q=None):
             last_fs_t = te
         if dumper is not None:
             dumper.feed(frame, t)
-            try:
-                while True:
-                    cmd = cmd_q.get_nowait()
-                    if cmd[0] == "dump":
-                        dumper.request(cmd[1])
-            except Exception:
-                pass
+            drain_cmds()
         if got:
             last_arr = t
         # 레인 수 판별은 실제로 노트가 흘러가는 동안만 (결과 화면·선곡 화면의 그림을 노트로 착각해
@@ -393,6 +404,8 @@ def _run(q, stop_evt, cfg, cmd_q=None):
         now = time.perf_counter()
         proc.append((now - t0) * 1000.0)
         if now - t_rep >= 0.5:
+            if dumper is None:
+                drain_cmds()
             tr0 = trackers[guessed] if guessed in trackers else next(iter(trackers.values()))
             fps = (n + skipped) / (now - t_rep)         # 화면 프레임 수 (분석이 건너뛴 것 포함)
             p95 = sorted(proc)[int(len(proc) * 0.95)] if proc else 0.0

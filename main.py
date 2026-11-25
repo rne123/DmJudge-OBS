@@ -146,6 +146,7 @@ def main():
     ctrl.start_capture()
 
     last_refresh = [0.0]
+    rec_sent = [bool(cfg.get("record_save"))]
 
     def poll():
         pressed = False
@@ -193,6 +194,8 @@ def main():
                         app.set_status(msg="결과 화면 읽음: MAX 100%% %d · 100%% 아님 %d · BREAK %d  (분석기 범위 밖 %d)%s" % (
                             rec["game"][0], rec["non100"], rec["brk"], ses.predicted_out(rec), zt))
                         app.on_song_end()
+                    if len(m) > 3 and m[3] is not None and cfg.get("record_save"):
+                        ses.save_record(m[3], m[2], cover=app.window_rect())
                 elif m[0] == "songend":
                     ses.on_songend(m[1])
                     app.on_song_end()
@@ -217,6 +220,15 @@ def main():
         except queue.Empty:
             pass
         ses.tick()
+        msgs = getattr(ses, "record_msgs", None)
+        while msgs:
+            app.set_status(msg=msgs.pop(0))
+        if bool(cfg.get("record_save")) != rec_sent[0]:      # [기록 저장] 켜고 끈 것을 캡처 프로세스에 알림
+            rec_sent[0] = bool(cfg.get("record_save"))
+            try:
+                cmd_q.put(("recsave", rec_sent[0]))
+            except Exception:
+                pass
         if ses.dump_requests:
             for tq in ses.dump_requests:
                 try:

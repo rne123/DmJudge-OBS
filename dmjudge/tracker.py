@@ -255,6 +255,8 @@ class NoteTracker:
         dt = t - self.prev_t
         if dt <= 0:
             return []
+        if self._frozen(blobs, t, dt):
+            return []
 
         if self.v is None or self._lost >= 2:
             self._bootstrap(blobs, t)
@@ -395,6 +397,30 @@ class NoteTracker:
         self.prev_t = t
         self.last_ids = [e[4] for e in ev]
         return [(e[0], e[1], e[2], e[3]) + ((e[5],) if self.debug else ()) for e in ev]
+
+    FREEZE_MAX_MS = 120.0
+
+    def _frozen(self, blobs, t, dt):
+        """게임 화면이 잠깐 멈춘 프레임(노트가 전부 그대로)인지. 맞으면 이 프레임은 건너뛴다.
+        실측(ENERGY SYNERGY MATRIX): 노트가 40ms쯤 멈췄다가 멈춘 만큼 한 번에 따라잡음 — 게임 시간은 그대로 흐름.
+        건너뛰지 않으면 멈춘 동안 속도를 0 가까이로 낮췄다가 따라잡는 움직임을 놓쳐서, 그 전에 보인 노트들의
+        도달이 수십 ms 늦게 계산된다. 일시정지처럼 길게 멈추면(FREEZE_MAX_MS 넘음) 예전처럼 처리한다."""
+        prev = getattr(self, "_frz_prev", None)
+        cur = sorted((b[0], int(b[2])) for b in blobs if not b[4] and not b[3])
+        self._frz_prev = cur
+        v = self.v or 0.0
+        if prev is None or len(cur) < 2 or v < 0.4 or v * dt < 4.0 or cur != prev:
+            if getattr(self, "_frz_t0", None) is not None:
+                self._frz_t0 = None
+            return False
+        if getattr(self, "_frz_t0", None) is None:
+            self._frz_t0 = self.prev_t
+        if t - self._frz_t0 > self.FREEZE_MAX_MS:
+            # 길게 멈춤(일시정지 등): 건너뛰기를 그만두고, 멈춘 마지막 프레임부터 이어서 예전처럼
+            self.prev_t = max(self.prev_t, getattr(self, "_frz_last", self.prev_t))
+            return False
+        self._frz_last = t
+        return True
 
     def _drop_static(self, blobs, t):
         """화면에 고정된 그림(SIDE TRACK 알람 상자, FAST/SLOW 글자 등)을 '가림 구역'으로 처리한다.
@@ -827,6 +853,7 @@ class JudgeLineWatch:
         self.first_arr = None
         self.last_arr = None
         self._tops = []          # 최근 몇 프레임의 '아래가 가려진 덩어리' 윗끝 {레인: [y]}
+        self._gated = []         # '곡 끝' 상태에서 버려진 확실한 도달 시각 (다시 시작 감지용)
 
     def _band(self, frame):
         y0 = max(0, self.y - 2)
@@ -862,8 +889,35 @@ class JudgeLineWatch:
             self._tops.pop(0)
         return res
 
-    def feed(self, frame, t, arrived: bool, covered: bool):
-        """arrived: 이번 프레임에 확실한 도달이 있었음 / covered: 판정선 쪽으로 이어지는 노트가 보임"""
+    REOPEN_N = 10          # '곡 끝' 상태에서 확실한 도달이 이만큼
+    REOPEN_SPAN = 1500.0   # 이 시간(ms) 넘게 이어지면 곡이 다시 시작된 것으로 봄
+    REOPEN_WIN = 3000.0
+
+    def _regrab(self, t, vis):
+        """곡 중 판정선이 잘 안 보이면(노트·이펙트가 많은 순간에 모양을 기억한 경우) 2.5초마다
+        최근 2.5초 화면의 중앙값으로 모양을 다시 만들어 보고, 그게 최근 화면과 더 잘 맞을 때만 바꾼다.
+        (곡 끝을 못 잡던 문제: 안전장치 '판정선이 15% 넘게 보여야 곡 끝'에 막힘)"""
+        self._w_n = getattr(self, "_w_n", 0) + 1
+        self._w_seen = getattr(self, "_w_seen", 0) + vis
+        if t - getattr(self, "_w_t", -1e18) < 2500.0:
+            return
+        r = self._w_seen / max(1, self._w_n)
+        self._w_t, self._w_n, self._w_seen = t, 0, 0
+        if r >= 0.3 or len(self.buf) < 60:
+            return
+        bands = np.stack([b for _, b in self.buf])
+        cand = np.median(bands, axis=0)
+
+        def score(tm):
+            d = np.abs(bands - tm[None]).mean(axis=(1, 3))
+            return int(((d < 40).mean(axis=1) > 0.45).sum())
+        if self.tmpl is None or score(cand) > score(self.tmpl) * 1.5 + 5:
+            self.tmpl = cand
+            self.seen_n = self.samp_n = 0
+
+    def feed(self, frame, t, arrived: bool, covered: bool, gated: int = 0):
+        """arrived: 이번 프레임에 확실한 도달이 있었음 / covered: 판정선 쪽으로 이어지는 노트가 보임
+        gated: '곡 끝' 상태라서 버려진 이번 프레임의 확실한 도달 수"""
         try:
             band = self._band(frame)
         except Exception:
@@ -889,10 +943,23 @@ class JudgeLineWatch:
             self.last_seen = t
             if self.ended:
                 self.ended = False
+                self._gated = []
+                ev = "start"
+        elif self.ended and gated:
+            # 기억한 판정선 모양이 안 보여도(다른 버튼 수·기어, 선곡 화면 그림을 잘못 기억한 경우) 확실한 도달이
+            # 1.5초 넘게 꾸준히 나오면 곡이 시작된 것: 다시 받고, 판정선 모양은 다음 도달 때 이 곡 기준으로 새로 기억
+            self._gated.append(t)
+            while self._gated and t - self._gated[0] > self.REOPEN_WIN:
+                self._gated.pop(0)
+            if len(self._gated) >= self.REOPEN_N and t - self._gated[0] >= self.REOPEN_SPAN:
+                self.ended = False
+                self.playing = False
+                self._gated = []
                 ev = "start"
         if self.playing:
             self.samp_n += 1
             self.seen_n += vis
+            self._regrab(t, vis)
             if arrived:
                 self.last_seen = max(self.last_seen or t, t - 300.0)
             quiet = t - (self.last_seen or t)

@@ -279,6 +279,17 @@ def suggest_zero(j_raw: np.ndarray, labels: np.ndarray, win: float, w_label: flo
     return float((g[0] + g[-1]) / 2)
 
 
+# 영점 거울 해를 게임 FAST/SLOW 글자로 가를 때: 실시간 글자 짝짓기는 틀린 노트에 붙는 일이 많아서(실측 절반 가까이) 보수적으로
+LAB_SIGMA = 5.0
+LAB_NOISE = 0.3
+LAB_MIN = 8
+LAB_MARGIN = 4.0
+# 곡마다 추가 흔들림(추적 오류 곡·결과 숫자와 안 맞는 노트): 분산에 더함. 0이면 예전과 같음.
+# 사용자 22곡 실측: 예전(0, 0)은 3~5곡일 때 "95% 범위"에 실제 값이 66~68%만 들어갔음 → (0.5, 0.2)로 95~98%
+OVER_A = 0.5
+OVER_B = 0.2
+
+
 def fit_zero(songs, win: float = 125.0 / 3.0, sigma: float = 1.5, lo=-30.0, hi=40.0, step=0.05, brk=1e9):
     """결과 화면 기반 영점 보정 추천.
     songs: [(e0 배열, 게임의 MAX 100% 아닌 개수(BREAK 제외))] — e0 = 화면 기준 오차 + 판정 타이밍 (보정 전).
@@ -287,7 +298,17 @@ def fit_zero(songs, win: float = 125.0 / 3.0, sigma: float = 1.5, lo=-30.0, hi=4
     (brk: 이보다 큰 오차는 BREAK로 볼 때 쓰는 값. 판정 등급이 1/60초씩 넓어져 MAX 1%가 분석기 짝짓기 범위(-190~+150)보다 넓으므로 기본은 끔)  
     반환: dict(best, lo, hi(95%), per=[(게임 개수, K=best일 때 예상 개수)]) 또는 None"""
     from math import erf, sqrt
-    songs = [(np.asarray(e, float), int(n)) for e, n in songs if len(e) >= 50]
+    # songs 항목: (e0, 게임 개수) 또는 (e0, 게임 개수, 노트별 게임 글자 -1 FAST / +1 SLOW / 0 못 봄)
+    raw = []
+    for s_ in songs:
+        e, n = s_[0], s_[1]
+        lab = s_[2] if len(s_) > 2 else None
+        if len(e) < 50:
+            continue
+        e = np.asarray(e, float)
+        lab = np.asarray(lab, float) if lab is not None and len(lab) == len(e) else np.zeros(len(e))
+        raw.append((e, int(n), lab))
+    songs = [(e, n) for e, n, _ in raw]
     if not songs:
         return None
     ks = np.arange(lo, hi + step / 2, step)
@@ -309,10 +330,55 @@ def fit_zero(songs, win: float = 125.0 / 3.0, sigma: float = 1.5, lo=-30.0, hi=4
             far_out = (~near) & (np.abs(d) > win) & (np.abs(d) <= brk)
             P = 1.0 - (phi((win - d[near]) / sigma) - phi((-win - d[near]) / sigma))
             mu[i] = far_out.sum() + P.sum()
-            var[i] = (P * (1 - P)).sum() + 0.25
+            var[i] = (P * (1 - P)).sum() + 0.25 + OVER_A + (OVER_B * mu[i]) ** 2
         LL += -0.5 * (n - mu) ** 2 / var - 0.5 * np.log(var)
         curves.append(mu)
     i = int(np.argmax(LL))
     ok = ks[LL >= LL[i] - 1.92]
-    return {"best": float(ks[i]), "lo": float(ok.min()), "hi": float(ok.max()),
-            "per": [(n, float(c[i])) for (e, n), c in zip(songs, curves)]}
+    res = {"best": float(ks[i]), "lo": float(ok.min()), "hi": float(ok.max())}
+    # ---- 거울 해 검사: '100% 아닌 개수'만 보면 FAST 쪽으로 밀린 값과 SLOW 쪽으로 밀린 값이 똑같이 맞을 수 있다
+    #      (예: 실제는 FAST 1·SLOW 4인데 FAST 4·SLOW 1로 개수만 맞는 값). 곡이 적을 때 생김.
+    #      거의 같은 높이의 봉우리가 둘 이상이면, 게임 FAST/SLOW 글자(방향)로 고르고, 글자가 모자라면 '아직 모름'.
+    AMB = 3.0                                    # 우도 차이 3 = 약 20배 안쪽이면 '비슷하게 맞음'
+    good = LL >= LL[i] - AMB
+    peaks = []                                   # 이어진 구간마다 가장 높은 점
+    j = 0
+    while j < len(ks):
+        if good[j]:
+            k0 = j
+            while j + 1 < len(ks) and good[j + 1]:
+                j += 1
+            seg = np.arange(k0, j + 1)
+            peaks.append(int(seg[np.argmax(LL[seg])]))
+        j += 1
+    if len(peaks) > 1:
+        E = np.concatenate([e for e, _, _ in raw])
+        L = np.concatenate([lab for _, _, lab in raw])
+        m_ = L != 0
+        sc = []
+        for pk in peaks:
+            d = E[m_] + ks[pk]
+            s3 = LAB_SIGMA
+            pf = phi((-win - d) / s3)                     # 게임 오차가 FAST 쪽 범위 밖일 확률
+            ps = 1.0 - phi((win - d) / s3)
+            p = np.where(L[m_] < 0, pf, ps)
+            sc.append(float(np.log(LAB_NOISE / 2 + (1 - LAB_NOISE) * p).sum()))   # 글자 짝짓기 실수 몫
+        order = np.argsort(sc)[::-1]
+        if m_.sum() >= LAB_MIN and sc[order[0]] - sc[order[1]] >= LAB_MARGIN:
+            pk = peaks[int(order[0])]
+            # 고른 봉우리 주변만으로 95% 범위
+            a_ = pk
+            while a_ > 0 and LL[a_ - 1] >= LL[pk] - 1.92:
+                a_ -= 1
+            b_ = pk
+            while b_ + 1 < len(ks) and LL[b_ + 1] >= LL[pk] - 1.92:
+                b_ += 1
+            i = pk
+            res = {"best": float(ks[pk]), "lo": float(ks[a_]), "hi": float(ks[b_]), "by_text": True,
+                   "alt": [float(ks[q]) for q in peaks if q != pk]}
+        else:
+            res["ambiguous"] = [float(ks[q]) for q in sorted(peaks, key=lambda q: -LL[q])]
+            res["lo"] = min(res["lo"], float(ks[min(peaks)]))
+            res["hi"] = max(res["hi"], float(ks[max(peaks)]))
+    res["per"] = [(n, float(c[i])) for (e, n), c in zip(songs, curves)]
+    return res

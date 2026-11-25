@@ -429,6 +429,12 @@ class App(GraphDraw):
                      font=(FONT, 9), rowheight=20, borderwidth=0)
         st.configure("Treeview.Heading", background="#262a35", foreground=FG, font=(FONT, 9, "bold"))
         st.configure("TCombobox", fieldbackground="#262a35", background="#262a35", foreground="#000")
+        # 탭: 어두운 바탕에, 고른 탭만 밝게
+        st.configure("Dm.TNotebook", background=BG, borderwidth=0, tabmargins=(0, 2, 0, 0))
+        st.configure("Dm.TNotebook.Tab", background="#20232c", foreground=DIM, font=(FONT, 9, "bold"),
+                     padding=(10, 4), borderwidth=0)
+        st.map("Dm.TNotebook.Tab", background=[("selected", "#343a48"), ("active", "#2a2e3a")],
+               foreground=[("selected", FG), ("active", FG)], padding=[("selected", (10, 5))])
         self._build()
         numeric_only(root)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -437,8 +443,22 @@ class App(GraphDraw):
     def _lbl(self, parent, text="", size=10, bold=False, fg=FG, bg=BG, **kw):
         return tk.Label(parent, text=text, bg=bg, fg=fg, font=(FONT, size, "bold" if bold else "normal"), **kw)
 
+    def _btn(self, parent, text, cmd, bold=False):
+        return tk.Button(parent, text=text, command=cmd, bg="#262a35", fg=FG, activebackground="#343a48",
+                         activeforeground=FG, relief="flat", font=(FONT, 9, "bold" if bold else "normal"), padx=6)
+
+    def _hint(self, parent, text):
+        """탭 안 작은 설명 줄 (창 폭에 맞춰 줄바꿈)"""
+        lb = self._lbl(parent, text, 9, fg=DIM, anchor="w", justify="left", width=1)
+        lb.pack(fill="x", padx=8, pady=(4, 2))
+        self._wrap_lbls.append(lb)
+        return lb
+
     def _build(self):
         r = self.root
+        self._wrap_lbls = []
+        ck = dict(bg=BG, fg=FG, selectcolor="#262a35", activebackground=BG, activeforeground=FG, font=(FONT, 9))
+        # 맨 아래 고정 버튼 (_build 처음에 자리를 잡아 둬서 창이 짧아도 항상 보임)
         self._btnbar = WrapFrame(r, bg=BG)
         self._btnbar.pack(side="bottom", fill="x", padx=8, pady=(2, 8))
         top = tk.Frame(r, bg=BG)
@@ -448,7 +468,7 @@ class App(GraphDraw):
         self.lbl_status.pack(fill="x")
         self.root.bind("<Configure>", self._on_resize)
 
-        # 모드 선택 버튼
+        # 모드 선택 버튼 (자주 바꾸니 탭 밖, 항상 보임)
         fm = tk.Frame(r, bg=BG)
         fm.pack(fill="x", padx=8, pady=(2, 2))
         self._lbl(fm, "모드", 10, True).pack(side="left", padx=(0, 6))
@@ -460,16 +480,96 @@ class App(GraphDraw):
             b.pack(side="left", padx=2)
             self.mode_btns[val] = b
         self._paint_mode()
+
+        # 요약 (판정선 추천 결과 + 영점 추천 알림: 어느 탭에서든 항상 보임)
+        box = tk.Frame(r, bg="#1b1e26", highlightthickness=1, highlightbackground="#2b303c")
+        box.pack(fill="x", padx=8, pady=6)
+        self.lbl_line = self._lbl(box, "", 15, True, bg="#1b1e26", anchor="w", width=1, justify="left")
+        self.lbl_line.pack(fill="x", padx=8, pady=(6, 0))
+        self.lbl_spread = self._lbl(box, "", 11, bg="#1b1e26", anchor="w", width=1, justify="left")
+        self.lbl_spread.pack(fill="x", padx=8)
+        self.lbl_fs = self._lbl(box, "", 13, True, bg="#1b1e26", anchor="w", width=1, justify="left")
+        self.lbl_fs.pack(fill="x", padx=8)
+        self.lbl_in = self._lbl(box, "", 11, bg="#1b1e26", anchor="w", width=1, justify="left")
+        self.lbl_in.pack(fill="x", padx=8)
+        self.lbl_rec = self._lbl(box, "", 13, True, fg=OKC, bg="#1b1e26", anchor="w", width=1, justify="left")
+        self.lbl_rec.pack(fill="x", padx=8, pady=(4, 0))
+        self.lbl_margin = self._lbl(box, "", 9, fg=DIM, bg="#1b1e26", anchor="w", width=1, justify="left")
+        self.lbl_margin.pack(fill="x", padx=8)
+        self.lbl_sync = self._lbl(box, "", 9, fg=DIM, bg="#1b1e26", anchor="w", width=1, justify="left")
+        self.lbl_sync.pack(fill="x", padx=8, pady=(0, 6))
+        # 영점 보정 추천 알림 (결과 화면으로 모은 곡 기준, 지금 보정값이 맞는 범위 밖일 때만 보임)
+        self.banner = tk.Frame(box, bg="#3a2f12")
+        self.lbl_banner = tk.Label(self.banner, text="", bg="#3a2f12", fg=OKC, font=(FONT, 10, "bold"),
+                                   anchor="w", justify="left", width=1)
+        self.lbl_banner.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+        for txt, cmd in (("무시", self.on_dismiss), ("보정 적용", self.on_apply_suggest)):
+            tk.Button(self.banner, text=txt, command=cmd, bg="#5a4a1a", fg=FG, relief="flat",
+                      font=(FONT, 9), padx=6).pack(side="right", padx=3, pady=3)
+        self._banner_on = False
+
+        # ---- 탭: 기능별로 나눠서 한 번에 하나만 보이게
+        self.nb = ttk.Notebook(r, style="Dm.TNotebook")
+        self.nb.pack(fill="both", expand=True, padx=8, pady=(0, 2))
+        self.TAB_NAMES = ("그래프", "판정·영점", "인디케이터", "오답노트·기록", "설정")
+        tabs = []
+        for name in self.TAB_NAMES:
+            fr = tk.Frame(self.nb, bg=BG)
+            self.nb.add(fr, text=" %s " % name)
+            tabs.append(fr)
+        t_graph, t_judge, t_ind, t_rec, t_set = tabs
+
+        # ===== 탭 1: 그래프
+        gb = WrapFrame(t_graph, bg=BG)
+        gb.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
+        gb.add(self._btn(gb, "기록 불러오기", self.on_load), 2, 2)
+        gb.add(self._btn(gb, "CSV 저장", self.on_csv), 2, 2)
+        gsel = tk.Frame(t_graph, bg=BG)
+        gsel.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(gsel, text="그래프", bg=BG, fg=DIM, font=(FONT, 9)).pack(side="left")
+        self.graph_names = GRAPH_NAMES
+        gsv = self.cfg.get("graph", self.graph_names[0])
+        if str(gsv).startswith("전체 보기"):
+            gsv = self.graph_names[4]
+        self.graph_var = tk.StringVar(value=gsv)
+        if self.graph_var.get() not in self.graph_names:
+            self.graph_var.set(self.graph_names[0])
+        self.cb_graph = ttk.Combobox(gsel, textvariable=self.graph_var, values=self.graph_names,
+                                     state="readonly", width=24, font=(FONT, 9))
+        self.cb_graph.pack(side="left", padx=6)
+        self.cb_graph.bind("<<ComboboxSelected>>", lambda e: self.on_graph())
+        # 그래프 설명은 콤보 아래 줄에, 높이 2줄 고정 (옆으로 길어지거나 위아래로 들썩이지 않게)
+        self.lbl_graph = tk.Label(t_graph, text="", bg=BG, fg=DIM, font=(FONT, 9), anchor="nw", justify="left",
+                                  width=1, height=2)
+        self.lbl_graph.pack(fill="x", padx=8)
+        self.cv = tk.Canvas(t_graph, width=420, height=130, bg="#101217", highlightthickness=0)
+        self.cv.pack(padx=8, pady=2, fill="x")
+        # '전체 보기'용 그래프 2개 (평소엔 숨김)
+        self.cv2 = tk.Canvas(t_graph, width=420, height=130, bg="#101217", highlightthickness=0)
+        self._all_view = False
+        cols = ("n", "mean", "std", "fast", "slow", "in", "etc")
+        self.tree = ttk.Treeview(t_graph, columns=cols, height=5)     # 창이 짧으면 표가 먼저 줄어듦
+        self.tree.heading("#0", text="구분")
+        for c, t, w in zip(cols, ("개수", "평균", "흔들림", "FAST", "SLOW", "100%", "놓침/채터"),
+                           (42, 52, 52, 44, 44, 52, 62)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor="e")
+        self.tree.column("#0", width=120)
+        self.tree.pack(fill="both", expand=True, padx=8, pady=4)
+
+        # ===== 탭 2: 판정·영점
+        self._hint(t_judge, "게임 설정과 똑같이 맞춰 주세요. 게임 모드마다 판정·출력 타이밍과 영점을 따로 기억해요(고르면 그 값으로 바뀜). "
+                            "영점 보정은 결과 화면이 3곡 이상 모이면 추천해요.")
+        fg_ = tk.Frame(t_judge, bg=BG)
+        fg_.pack(fill="x", padx=8, pady=2)
         from .session import GAME_MODES
-        self._lbl(fm, "  게임 모드", 9).pack(side="left", padx=(8, 2))
+        self._lbl(fg_, "게임 모드", 9).pack(side="left", padx=(0, 2))
         self.var_gmode = tk.StringVar(value=self.cfg.get("game_mode", GAME_MODES[0]))
-        cgm = ttk.Combobox(fm, textvariable=self.var_gmode, values=GAME_MODES, state="readonly", width=10,
+        cgm = ttk.Combobox(fg_, textvariable=self.var_gmode, values=GAME_MODES, state="readonly", width=10,
                            font=(FONT, 9))
         cgm.pack(side="left")
         cgm.bind("<<ComboboxSelected>>", lambda e: self.on_gmode())
-
-        # 설정 행
-        f = WrapFrame(r, bg=BG)
+        f = WrapFrame(t_judge, bg=BG)
         f.pack(fill="x", padx=8, pady=2)
         self.var_judge = tk.IntVar(value=int(self.cfg.get("judge_setting_ms", 0)))
         self.var_out = tk.IntVar(value=int(self.cfg.get("output_setting_ms", 0)))
@@ -514,52 +614,32 @@ class App(GraphDraw):
         f.add(pf, 0, 10)
         self.sp_calib.bind("<Return>", lambda e: self.on_calib_manual())
         self.sp_calib.bind("<FocusOut>", lambda e: self.on_calib_manual())
-
-        f2 = WrapFrame(r, bg=BG)
+        # 버튼별 영점 따로 쓰기: 체크한 버튼은 그 버튼 전용 영점, 나머지는 공통 영점
+        fb = WrapFrame(t_judge, bg=BG)
+        fb.pack(fill="x", padx=8, pady=2)
+        fb.add(self._lbl(fb, "버튼별 영점 따로:", 9), 0, 4)
+        self.var_split = {}
+        sp_ = self.cfg.get("calib_split") or {}
+        for m in ("4B", "5B", "6B", "8B"):
+            v = tk.IntVar(value=1 if sp_.get(m) else 0)
+            self.var_split[m] = v
+            fb.add(tk.Checkbutton(fb, text=m, variable=v, command=lambda m=m: self.on_calib_split(m), **ck), 0, 2)
+        self.lbl_calib_src = self._lbl(t_judge, "", 9, fg=DIM, anchor="w", justify="left", width=1)
+        self.lbl_calib_src.pack(fill="x", padx=8)
+        self._wrap_lbls.append(self.lbl_calib_src)
+        f2 = WrapFrame(t_judge, bg=BG)
         f2.pack(fill="x", padx=8, pady=2)
-        ck = dict(bg=BG, fg=FG, selectcolor="#262a35", activebackground=BG, activeforeground=FG, font=(FONT, 9))
         self.var_measure = tk.StringVar(value=self.cfg.get("measure", "eye"))
         for txt, val in (("눈판정 측정(소리 끔)", "eye"), ("귀판정 측정", "ear")):
             f2.add(tk.Radiobutton(f2, text=txt, value=val, variable=self.var_measure, command=self.on_settings, **ck))
-        self.var_dark = tk.IntVar(value=1 if self.cfg.get("dark_notes") else 0)
-        f2.add(tk.Checkbutton(f2, text="어두운 노트 스킨", variable=self.var_dark, command=self.on_dark, **ck), 4)
-        self.var_ring = tk.IntVar(value=1 if self.cfg.get("ring_notes") else 0)
-        f2.add(tk.Checkbutton(f2, text="동그란 노트 스킨", variable=self.var_ring, command=self.on_ring, **ck), 4)
-        self.var_big = tk.IntVar(value=1 if self.cfg.get("big_effects") else 0)
-        f2.add(tk.Checkbutton(f2, text="판정 이펙트가 큰 스킨", variable=self.var_big, command=self.on_big, **ck), 4)
-        # ---- 접고 펼치는 설정 묶음 (인디케이터·OBS·기타): 평소엔 접어서 그래프 자리를 넓게
-        hb = tk.Frame(r, bg=BG)
-        hb.pack(fill="x", padx=8, pady=(2, 0))
-        self._adv_open = bool(self.cfg["ui"].get("adv_open", False))
-        self.btn_adv = tk.Button(hb, text="", command=self.on_adv_toggle, bg="#262a35", fg=FG,
-                                 activebackground="#343a48", activeforeground=FG, relief="flat",
-                                 font=(FONT, 9, "bold"), padx=6, anchor="w")
-        self.btn_adv.pack(side="left")
-        self.lbl_adv = self._lbl(hb, "", 9, fg=DIM, anchor="w", justify="left", width=1)
-        self.lbl_adv.pack(side="left", fill="x", expand=True, padx=(8, 0))
-        self._adv_hdr = hb
-        box = self.adv_box = tk.Frame(r, bg=BG)
-        f2x = WrapFrame(box, bg=BG)
-        f2x.pack(fill="x", padx=8, pady=2)
-        pf = tk.Frame(f2x, bg=BG)
-        self._lbl(pf, "투명", 9).pack(side="left")
-        self.var_alpha = tk.IntVar(value=int(round(float(self.cfg["ui"].get("alpha", 0.92)) * 100)))
-        sa = tk.Spinbox(pf, from_=40, to=100, increment=5, width=4, textvariable=self.var_alpha,
-                        command=self.on_alpha, bg="#262a35", fg=FG, buttonbackground="#262a35",
-                        relief="flat", font=(FONT, 9))
-        sa.pack(side="left", padx=2)
-        sa.bind("<Return>", lambda e: self.on_alpha())
-        f2x.add(pf, 6)
-        self.var_thr = tk.IntVar(value=1 if self.cfg.get("capture_thread", True) else 0)
-        f2x.add(tk.Checkbutton(f2x, text="새 캡처 방식", variable=self.var_thr, command=self.on_capture_thread, **ck), 4)
-        self.var_focus = tk.IntVar(value=1 if self.cfg.get("focus_only", True) else 0)
-        f2x.add(tk.Checkbutton(f2x, text="게임 창이 맨 앞일 때만 키 기록", variable=self.var_focus,
-                              command=self.on_focus_only, **ck), 4)
+        fj = WrapFrame(t_judge, bg=BG)
+        fj.pack(fill="x", padx=8, pady=(6, 2))
+        fj.add(self._btn(fj, "영점 보정 (결과 화면)", self.on_game_calib, bold=True), 0, 4)
 
-        # 인디케이터 설정
-        f3 = WrapFrame(box, bg=BG)
-        f3.pack(fill="x", padx=8, pady=2)
+        # ===== 탭 3: 인디케이터
         io = self.cfg.get("indicator", {})
+        f3 = WrapFrame(t_ind, bg=BG)
+        f3.pack(fill="x", padx=8, pady=(6, 2))
         self.var_ind = tk.IntVar(value=1 if io.get("enabled", True) else 0)
         if not self.obs_edition:
             f3.add(tk.Checkbutton(f3, text="기어 위 인디케이터", variable=self.var_ind, command=self.on_indicator, **ck))
@@ -568,50 +648,43 @@ class App(GraphDraw):
         self.var_fl = tk.DoubleVar(value=float(io.get("flash_sec", 1.5)))
         self.var_its = tk.IntVar(value=int(round(float(io.get("text_scale", 1.0)) * 100)))
         self.var_iw = tk.IntVar(value=int(round(float(io.get("width_frac", 0.7)) * 100)))
-        self.btn_move = tk.Button(f3, text="인디케이터 이동", command=self.on_ind_move, bg="#262a35", fg=FG,
-                                  activebackground="#343a48", activeforeground=FG, relief="flat",
-                                  font=(FONT, 9), padx=6)
+        self.btn_move = self._btn(f3, "인디케이터 이동", self.on_ind_move)
         if not self.obs_edition:
             f3.add(self.btn_move, 6)
-            f3.add(tk.Button(f3, text="위치 초기화", command=lambda: self.indicator and self.indicator.reset_position(),
-                             bg="#262a35", fg=FG, activebackground="#343a48", activeforeground=FG, relief="flat",
-                             font=(FONT, 9), padx=6), 2)
-            f3.add(tk.Button(f3, text="폭 초기화", command=lambda: self.indicator and self.indicator.reset_width(),
-                             bg="#262a35", fg=FG, activebackground="#343a48", activeforeground=FG, relief="flat",
-                             font=(FONT, 9), padx=6), 2)
+            f3.add(self._btn(f3, "위치 초기화", lambda: self.indicator and self.indicator.reset_position()), 2)
+            f3.add(self._btn(f3, "폭 초기화", lambda: self.indicator and self.indicator.reset_width()), 2)
+        else:
+            # OBS 브라우저 소스 (방송·녹화 화면에만 보임)
+            from .obs_server import obs_opts, obs_scale
+            oo = obs_opts(self.cfg)
+            self.var_obs = tk.IntVar(value=1 if oo["enabled"] else 0)
+            f3.add(tk.Checkbutton(f3, text="OBS 인디케이터 (브라우저 소스)", variable=self.var_obs,
+                                  command=self.on_obs, **ck))
+            self.var_obss = tk.IntVar(value=int(round(obs_scale(self.cfg) * 100)))
+            pf = tk.Frame(f3, bg=BG)
+            self._lbl(pf, "크기 %", 9).pack(side="left")
+            sp = tk.Spinbox(pf, from_=50, to=400, increment=10, width=4, textvariable=self.var_obss,
+                            command=self.on_obs, bg="#262a35", fg=FG, buttonbackground="#262a35",
+                            relief="flat", font=(FONT, 9))
+            sp.pack(side="left", padx=2)
+            sp.bind("<Return>", lambda e: self.on_obs())
+            f3.add(pf, 6)
+            f3.add(self._btn(f3, "주소 복사", self.on_obs_copy), 2)
+            f3.add(self._btn(f3, "브라우저로 보기", self.on_obs_open), 2)
+        f3s = WrapFrame(t_ind, bg=BG)
+        f3s.pack(fill="x", padx=8, pady=2)
         for txt, var, lo, hi, inc in (("표시 초", self.var_in, 0.5, 10, 0.5), ("ms 글자 초", self.var_fl, 0.3, 5, 0.1),
                                       ("글자 크기 %", self.var_its, 50, 250, 10)):
-            pf = tk.Frame(f3, bg=BG)
+            pf = tk.Frame(f3s, bg=BG)
             self._lbl(pf, txt, 9).pack(side="left")
             sp = tk.Spinbox(pf, from_=lo, to=hi, increment=inc, width=4, textvariable=var,
                             command=self.on_indicator, bg="#262a35", fg=FG, buttonbackground="#262a35",
                             relief="flat", font=(FONT, 9))
             sp.pack(side="left", padx=2)
             sp.bind("<Return>", lambda e: self.on_indicator())
-            f3.add(pf, 6)
-        # OBS 브라우저 소스 (방송·녹화 화면에만 보임)
-        from .obs_server import obs_opts
-        oo = obs_opts(self.cfg)
-        f3o = WrapFrame(box, bg=BG)
-        f3o.pack(fill="x", padx=8, pady=(0, 2))
-        self.var_obs = tk.IntVar(value=1 if oo["enabled"] else 0)
-        f3o.add(tk.Checkbutton(f3o, text="OBS 인디케이터 (브라우저 소스)", variable=self.var_obs,
-                               command=self.on_obs, **ck))
-        from .obs_server import obs_scale
-        self.var_obss = tk.IntVar(value=int(round(obs_scale(self.cfg) * 100)))
-        pf = tk.Frame(f3o, bg=BG)
-        self._lbl(pf, "크기 %", 9).pack(side="left")
-        sp = tk.Spinbox(pf, from_=50, to=400, increment=10, width=4, textvariable=self.var_obss,
-                        command=self.on_obs, bg="#262a35", fg=FG, buttonbackground="#262a35",
-                        relief="flat", font=(FONT, 9))
-        sp.pack(side="left", padx=2)
-        sp.bind("<Return>", lambda e: self.on_obs())
-        f3o.add(pf, 6)
-        for txt, cmd in (("주소 복사", self.on_obs_copy), ("브라우저로 보기", self.on_obs_open)):
-            f3o.add(tk.Button(f3o, text=txt, command=cmd, bg="#262a35", fg=FG, activebackground="#343a48",
-                              activeforeground=FG, relief="flat", font=(FONT, 9), padx=6), 2)
+            f3s.add(pf, 0, 10)
         # 인디케이터 표시 항목 (각각 켜고 끄기)
-        f3b = WrapFrame(box, bg=BG)
+        f3b = WrapFrame(t_ind, bg=BG)
         f3b.pack(fill="x", padx=8, pady=(0, 2))
         from .ind_state import modes_of
         fm, mm = modes_of(io)
@@ -628,101 +701,108 @@ class App(GraphDraw):
         self.var_ifade = tk.StringVar(value=self.FADE_LABELS.get(io.get("fade", "weak"), "약하게"))
         self.TFADE_LABELS = {"end": "끝에서만 (마지막 30%)", "mid": "보통 (40%부터 서서히)", "linear": "뜨자마자 서서히"}
         self.var_itfade = tk.StringVar(value=self.TFADE_LABELS.get(io.get("text_fade", "end"), "끝에서만 (마지막 30%)"))
-        for txt, var, labels, w in (("FAST/SLOW 표시", self.var_ifm, self.FS_LABELS, 26),
-                                    ("ms 표시", self.var_imm, self.MS_LABELS, 32),
-                                    ("선 연해짐", self.var_ifade, self.FADE_LABELS, 22),
-                                    ("글자 연해짐", self.var_itfade, self.TFADE_LABELS, 20)):
-            pf = tk.Frame(f3b, bg=BG)
-            self._lbl(pf, txt, 9).pack(side="left")
+        # 표시 방식 콤보는 한 줄에 하나씩 (이름 칸 폭을 맞춰서 세로로 가지런히)
+        for txt, var, labels, w in (("FAST/SLOW 표시", self.var_ifm, self.FS_LABELS, 30),
+                                    ("ms 표시", self.var_imm, self.MS_LABELS, 34),
+                                    ("선 연해짐", self.var_ifade, self.FADE_LABELS, 30),
+                                    ("글자 연해짐", self.var_itfade, self.TFADE_LABELS, 30)):
+            pf = tk.Frame(t_ind, bg=BG)
+            pf.pack(fill="x", padx=8, pady=1)
+            self._lbl(pf, txt, 9, width=14, anchor="w").pack(side="left")
             cbx = ttk.Combobox(pf, textvariable=var, values=list(labels.values()), state="readonly", width=w,
                                font=(FONT, 9))
             cbx.pack(side="left", padx=2)
             cbx.bind("<<ComboboxSelected>>", lambda e: self.on_indicator())
-            f3b.add(pf, 8)
         # 인디케이터 범위 설명은 따로 한 줄 (길어도 옆으로 밀지 않게)
-        self.lbl_range = self._lbl(box, "", 9, fg=DIM, anchor="w", justify="left", width=1)
-        self.lbl_range.pack(fill="x", padx=8, pady=(0, 2))
-        self._apply_adv()
+        self.lbl_range = self._lbl(t_ind, "", 9, fg=DIM, anchor="w", justify="left", width=1)
+        self.lbl_range.pack(fill="x", padx=8, pady=(6, 2))
+        if self.obs_edition:
+            self._hint(t_ind, "OBS → 소스 추가 → 브라우저 → [주소 복사]한 주소를 URL에 붙여넣기. "
+                              "OBS에서 소스를 늘리거나 줄이지 말고 '크기 %'로 바꾸세요 (줄이면 옅은 선이 사라져요).")
+        else:
+            self._hint(t_ind, "인디케이터 위에서 드래그하면 옮겨지고, 휠로 폭이 바뀌어요. 방향키 1px, Shift+방향키 10px.")
 
-        # 요약
-        box = tk.Frame(r, bg="#1b1e26", highlightthickness=1, highlightbackground="#2b303c")
-        box.pack(fill="x", padx=8, pady=6)
-        self.lbl_line = self._lbl(box, "", 15, True, bg="#1b1e26", anchor="w", width=1, justify="left")
-        self.lbl_line.pack(fill="x", padx=8, pady=(6, 0))
-        self.lbl_spread = self._lbl(box, "", 11, bg="#1b1e26", anchor="w", width=1, justify="left")
-        self.lbl_spread.pack(fill="x", padx=8)
-        self.lbl_fs = self._lbl(box, "", 13, True, bg="#1b1e26", anchor="w", width=1, justify="left")
-        self.lbl_fs.pack(fill="x", padx=8)
-        self.lbl_in = self._lbl(box, "", 11, bg="#1b1e26", anchor="w", width=1, justify="left")
-        self.lbl_in.pack(fill="x", padx=8)
-        self.lbl_rec = self._lbl(box, "", 13, True, fg=OKC, bg="#1b1e26", anchor="w", width=1, justify="left")
-        self.lbl_rec.pack(fill="x", padx=8, pady=(4, 0))
-        self.lbl_margin = self._lbl(box, "", 9, fg=DIM, bg="#1b1e26", anchor="w", width=1, justify="left")
-        self.lbl_margin.pack(fill="x", padx=8)
-        self.lbl_sync = self._lbl(box, "", 9, fg=DIM, bg="#1b1e26", anchor="w", width=1, justify="left")
-        self.lbl_sync.pack(fill="x", padx=8, pady=(0, 6))
-        # 영점 보정 추천 알림 (결과 화면으로 모은 곡 기준, 지금 보정값이 맞는 범위 밖일 때만 보임)
-        self.banner = tk.Frame(box, bg="#3a2f12")
-        self.lbl_banner = tk.Label(self.banner, text="", bg="#3a2f12", fg=OKC, font=(FONT, 10, "bold"),
-                                   anchor="w", justify="left", width=1)
-        self.lbl_banner.pack(side="left", fill="x", expand=True, padx=6, pady=4)
-        for txt, cmd in (("무시", self.on_dismiss), ("보정 적용", self.on_apply_suggest)):
-            tk.Button(self.banner, text=txt, command=cmd, bg="#5a4a1a", fg=FG, relief="flat",
-                      font=(FONT, 9), padx=6).pack(side="right", padx=3, pady=3)
-        self._banner_on = False
+        # ===== 탭 4: 오답노트·기록
+        self._hint(t_rec, "오답노트: 지금까지 친 곡을 박자·패턴별로 나눠서 어디서 밀리고 당기는지 알려 줘요.")
+        fc = WrapFrame(t_rec, bg=BG)
+        fc.pack(fill="x", padx=8, pady=2)
+        fc.add(self._btn(fc, "오답노트 (코치) 열기", self.on_coach, bold=True), 0, 4)
+        self._hint(t_rec, "기록 저장을 켜면 곡이 끝날 때 결과 화면 사진과 그 곡의 기록 CSV를 곡 이름으로 저장해요.")
+        fr2 = WrapFrame(t_rec, bg=BG)
+        fr2.pack(fill="x", padx=8, pady=2)
+        self.var_rec = tk.IntVar(value=1 if self.cfg.get("record_save") else 0)
+        fr2.add(tk.Checkbutton(fr2, text="기록 저장 (결과 화면 + 곡 CSV)", variable=self.var_rec,
+                               command=self.on_record, **ck), 0, 4)
+        fr2.add(self._btn(fr2, "기록 폴더", self.on_record_dir), 4)
+        fr3 = WrapFrame(t_rec, bg=BG)
+        fr3.pack(fill="x", padx=8, pady=(6, 2))
+        fr3.add(self._btn(fr3, "기록 불러오기", self.on_load), 0, 4)
+        fr3.add(self._btn(fr3, "CSV 저장 (지금까지)", self.on_csv), 0, 4)
 
-        # 그래프 (메뉴로 하나씩 골라 봄)
-        gsel = tk.Frame(r, bg=BG)
-        gsel.pack(fill="x", padx=8, pady=(2, 0))
-        tk.Label(gsel, text="그래프", bg=BG, fg=DIM, font=(FONT, 9)).pack(side="left")
-        self.graph_names = GRAPH_NAMES
-        gsv = self.cfg.get("graph", self.graph_names[0])
-        if str(gsv).startswith("전체 보기"):
-            gsv = self.graph_names[4]
-        self.graph_var = tk.StringVar(value=gsv)
-        if self.graph_var.get() not in self.graph_names:
-            self.graph_var.set(self.graph_names[0])
-        self.cb_graph = ttk.Combobox(gsel, textvariable=self.graph_var, values=self.graph_names,
-                                     state="readonly", width=24, font=(FONT, 9))
-        self.cb_graph.pack(side="left", padx=6)
-        self.cb_graph.bind("<<ComboboxSelected>>", lambda e: self.on_graph())
-        # 그래프 설명은 콤보 아래 줄에, 높이 2줄 고정 (옆으로 길어지거나 위아래로 들썩이지 않게)
-        self.lbl_graph = tk.Label(r, text="", bg=BG, fg=DIM, font=(FONT, 9), anchor="nw", justify="left",
-                                  width=1, height=2)
-        self.lbl_graph.pack(fill="x", padx=8)
-        self.cv = tk.Canvas(r, width=420, height=130, bg="#101217", highlightthickness=0)
-        self.cv.pack(padx=8, pady=2, fill="x")
-        # '전체 보기'용 그래프 2개 (평소엔 숨김)
-        self.cv2 = tk.Canvas(r, width=420, height=130, bg="#101217", highlightthickness=0)
-        self._all_view = False
+        # ===== 탭 5: 설정
+        self._hint(t_set, "처음 한 번만 맞추면 되는 것들이에요.")
+        fs1 = WrapFrame(t_set, bg=BG)
+        fs1.pack(fill="x", padx=8, pady=2)
+        for txt, cmd in (("키 설정", self.on_keys), ("영역 보정", self.on_calib), ("미리보기", self.on_preview)):
+            fs1.add(self._btn(fs1, txt, cmd), 0, 4)
+        self._lbl(t_set, "스킨", 9, True, anchor="w").pack(fill="x", padx=8, pady=(8, 0))
+        fs2 = WrapFrame(t_set, bg=BG)
+        fs2.pack(fill="x", padx=8, pady=2)
+        self.var_dark = tk.IntVar(value=1 if self.cfg.get("dark_notes") else 0)
+        fs2.add(tk.Checkbutton(fs2, text="어두운 노트 스킨", variable=self.var_dark, command=self.on_dark, **ck), 4)
+        self.var_ring = tk.IntVar(value=1 if self.cfg.get("ring_notes") else 0)
+        fs2.add(tk.Checkbutton(fs2, text="동그란 노트 스킨", variable=self.var_ring, command=self.on_ring, **ck), 4)
+        self.var_big = tk.IntVar(value=1 if self.cfg.get("big_effects") else 0)
+        fs2.add(tk.Checkbutton(fs2, text="판정 이펙트가 큰 스킨", variable=self.var_big, command=self.on_big, **ck), 4)
+        self._lbl(t_set, "창 · 캡처", 9, True, anchor="w").pack(fill="x", padx=8, pady=(8, 0))
+        fs3 = WrapFrame(t_set, bg=BG)
+        fs3.pack(fill="x", padx=8, pady=2)
+        pf = tk.Frame(fs3, bg=BG)
+        self._lbl(pf, "창 투명도 %", 9).pack(side="left")
+        self.var_alpha = tk.IntVar(value=int(round(float(self.cfg["ui"].get("alpha", 0.92)) * 100)))
+        sa = tk.Spinbox(pf, from_=40, to=100, increment=5, width=4, textvariable=self.var_alpha,
+                        command=self.on_alpha, bg="#262a35", fg=FG, buttonbackground="#262a35",
+                        relief="flat", font=(FONT, 9))
+        sa.pack(side="left", padx=2)
+        sa.bind("<Return>", lambda e: self.on_alpha())
+        fs3.add(pf, 0, 10)
+        self.var_thr = tk.IntVar(value=1 if self.cfg.get("capture_thread", True) else 0)
+        fs3.add(tk.Checkbutton(fs3, text="새 캡처 방식", variable=self.var_thr, command=self.on_capture_thread, **ck), 4)
+        self.var_focus = tk.IntVar(value=1 if self.cfg.get("focus_only", True) else 0)
+        fs3.add(tk.Checkbutton(fs3, text="게임 창이 맨 앞일 때만 키 기록", variable=self.var_focus,
+                               command=self.on_focus_only, **ck), 4)
 
-        # 표
-        cols = ("n", "mean", "std", "fast", "slow", "in", "etc")
-        self.tree = ttk.Treeview(r, columns=cols, height=5)     # 창이 짧으면 표가 먼저 줄어듦
-        self.tree.heading("#0", text="구분")
-        for c, t, w in zip(cols, ("개수", "평균", "흔들림", "FAST", "SLOW", "100%", "놓침/채터"),
-                           (42, 52, 52, 44, 44, 52, 62)):
-            self.tree.heading(c, text=t)
-            self.tree.column(c, width=w, anchor="e")
-        self.tree.column("#0", width=120)
-        self.tree.pack(fill="both", expand=True, padx=8, pady=4)
+        # 마지막에 보던 탭으로 열기
+        try:
+            ti = int(self.cfg["ui"].get("tab", 0))
+            if 0 <= ti < len(tabs):
+                self.nb.select(tabs[ti])
+        except Exception:
+            pass
+        self._tabs = tabs
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: self.on_tab())
 
-        # 버튼 (맨 아래 고정: _build 처음에 자리를 잡아 둬서 창이 짧아도 항상 보임)
+        # 맨 아래: 곡마다 자주 누르는 것만
         b = self._btnbar
-        for txt, cmd in (("초기화", self.on_reset), ("일시정지", self.on_pause), ("CSV 저장", self.on_csv),
-                         ("키 설정", self.on_keys), ("영역 보정", self.on_calib), ("미리보기", self.on_preview),
-                         ("영점 보정 (결과 화면)", self.on_game_calib), ("기록 불러오기", self.on_load)):
-            btn = tk.Button(b, text=txt, command=cmd, bg="#262a35", fg=FG, activebackground="#343a48",
-                            activeforeground=FG, relief="flat", font=(FONT, 9), padx=6)
+        for txt, cmd in (("초기화", self.on_reset), ("일시정지", self.on_pause)):
+            btn = self._btn(b, txt, cmd)
             b.add(btn, 2, 2)
             if txt == "일시정지":
                 self.btn_pause = btn
+
+    def window_rect(self):
+        """이 창이 화면에서 차지하는 곳 (테두리·제목 표시줄 몫 포함): 결과 화면 글자 인식 때 가리는 데 씀"""
+        try:
+            r = self.root
+            return (r.winfo_rootx() - 12, r.winfo_rooty() - 45, r.winfo_width() + 24, r.winfo_height() + 57)
+        except Exception:
+            return None
 
     def _on_resize(self, ev):
         if ev.widget is self.root:
             wl = max(300, ev.width - 30)
             for w in (self.lbl_status, self.lbl_margin, self.lbl_sync, self.lbl_in, self.lbl_spread,
-                      self.lbl_graph, self.lbl_range, self.lbl_banner):
+                      self.lbl_graph, self.lbl_range, self.lbl_banner, *self._wrap_lbls):
                 try:
                     w.configure(wraplength=wl)
                 except Exception:
@@ -790,8 +870,7 @@ class App(GraphDraw):
             return
         if abs(v - float(self.cfg.get("calib_ms", 0.0))) < 0.05:
             return
-        self.cfg["calib_ms"] = v
-        self.cfg.setdefault("calib_by_capture", {})["thread" if self.cfg.get("capture_thread", True) else "old"] = v
+        self.ses.set_calib(v)
         self.ses.suggest = None
         self.ctrl.save_cfg()
         self.refresh()
@@ -819,22 +898,10 @@ class App(GraphDraw):
         self.ctrl.save_cfg()
         if self.indicator is not None:
             self.indicator.update(force=True)
+        if self.obs is not None:
+            self.obs.update(force=True)
         if moved and not self.obs_edition:
             self.schedule_restart()
-
-    def _apply_adv(self):
-        name = "인디케이터 · OBS · 기타 설정"
-        self.btn_adv.configure(text=("▾ " if self._adv_open else "▸ ") + name)
-        if self._adv_open:
-            self.adv_box.pack(fill="x", after=self._adv_hdr)
-        else:
-            self.adv_box.pack_forget()
-
-    def on_adv_toggle(self):
-        self._adv_open = not self._adv_open
-        self.cfg["ui"]["adv_open"] = self._adv_open
-        self._apply_adv()
-        self.ctrl.save_cfg()
 
     def on_obs(self):
         try:
@@ -865,6 +932,14 @@ class App(GraphDraw):
         import webbrowser
         webbrowser.open(self.obs.url)
 
+    def on_focus_only(self):
+        on = bool(self.var_focus.get())
+        self.cfg["focus_only"] = on
+        fo = getattr(self.ctrl, "focus_only", None)
+        if fo is not None:
+            fo.value = 1 if on else 0
+        self.ctrl.save_cfg()
+
     def schedule_restart(self):
         # 인디케이터가 덮는 줄은 분석에서 '가려짐'으로 처리하므로 위치가 바뀌면 캡처를 다시 시작
         if self._restart_job is not None:
@@ -888,19 +963,21 @@ class App(GraphDraw):
         cb["thread" if self.cfg.get("capture_thread", True) else "old"] = float(self.cfg.get("calib_ms", 0.0))
         self.cfg["capture_thread"] = bool(self.var_thr.get())
         # 캡처 방식마다 화면 시각 기준이 조금 다를 수 있어서 영점 보정값을 따로 기억
-        self.cfg["calib_ms"] = float(cb.get("thread" if self.cfg["capture_thread"] else "old", 0.0))
+        self.ses.set_calib(float(cb.get("thread" if self.cfg["capture_thread"] else "old", 0.0)))
         self.ses.calib_songs = []
         self.ctrl.save_cfg()
         self.ses.log("capture_thread", int(self.cfg["capture_thread"]))
         self.ctrl.restart_capture()
 
-    def on_focus_only(self):
-        on = bool(self.var_focus.get())
-        self.cfg["focus_only"] = on
-        fo = getattr(self.ctrl, "focus_only", None)
-        if fo is not None:
-            fo.value = 1 if on else 0
-        self.ctrl.save_cfg()
+    def on_tab(self):
+        """고른 탭을 기억해 두었다가 다음에 그 탭으로 연다"""
+        try:
+            i = self._tabs.index(self.root.nametowidget(self.nb.select()))
+        except Exception:
+            return
+        if self.cfg["ui"].get("tab") != i:
+            self.cfg["ui"]["tab"] = i
+            self.ctrl.save_cfg()
 
     def on_alpha(self):
         try:
@@ -924,6 +1001,22 @@ class App(GraphDraw):
         self.ctrl.save_cfg()
         self.schedule_restart()
 
+    def on_record(self):
+        self.cfg["record_save"] = bool(self.var_rec.get())
+        self.ctrl.save_cfg()
+        if self.cfg["record_save"]:
+            from . import record
+            self.set_status(msg="기록 저장 켜짐: 곡이 끝나 결과 화면을 읽으면 '%s'에 자동 저장해요." % record.record_dir(self.cfg))
+
+    def on_record_dir(self):
+        from . import record
+        d = record.record_dir(self.cfg)
+        try:
+            os.makedirs(d, exist_ok=True)
+            os.startfile(d)
+        except Exception as e:
+            messagebox.showerror("기록 폴더", "폴더를 열지 못했어요: %r" % (e,))
+
     def on_big(self):
         self.cfg["big_effects"] = bool(self.var_big.get())
         self.ctrl.save_cfg()
@@ -944,32 +1037,59 @@ class App(GraphDraw):
         self.ctrl.restart_capture()
 
     def on_gmode(self):
-        self.cfg["game_mode"] = self.var_gmode.get()
+        """게임 모드 = 프리셋: 판정·출력 타이밍과 영점을 그 모드에 저장된 값으로 바꿈"""
+        new = self.var_gmode.get()
+        if new == self.cfg.get("game_mode"):
+            return
+        self.ses.switch_gmode(new)
+        try:
+            self.var_judge.set(int(self.cfg.get("judge_setting_ms", 0)))
+            self.var_out.set(int(self.cfg.get("output_setting_ms", 0)))
+            self.var_calib.set(round(float(self.cfg.get("calib_ms", 0.0)), 1))
+        except Exception:
+            pass
+        self.ses.suggest = None
         self.ctrl.save_cfg()
-        self._apply_zero_preset(force=True)
+        self.set_status(msg="%s 설정: 판정 타이밍 %+d · 출력 타이밍 %+d · 영점 보정 %+.1f ms" % (
+            new, int(self.cfg.get("judge_setting_ms", 0)), int(self.cfg.get("output_setting_ms", 0)),
+            float(self.cfg.get("calib_ms", 0.0))))
         self.refresh()
 
-    def zero_key(self):
-        from .session import group_key
-        return group_key(self.ses.active_mode() or self.cfg.get("mode"), self.cfg.get("game_mode"))
-
     def _apply_zero_preset(self, force=False):
-        """'그룹별 영점 따로 쓰기'를 켰으면, 버튼 모드·게임 모드가 바뀔 때 그 그룹에 저장된 영점으로 바꿈"""
-        if not self.cfg.get("calib_by_group"):
-            return
-        k = self.zero_key()
-        if not force and k == getattr(self, "_zero_key_last", None):
-            return
-        self._zero_key_last = k
-        v = (self.cfg.get("calib_presets") or {}).get(k)
-        if v is not None and abs(float(v) - float(self.cfg.get("calib_ms", 0.0))) > 0.05:
-            self.cfg["calib_ms"] = round(float(v), 1)
+        """버튼 모드가 바뀌면 그 버튼의 영점으로 (버튼별 따로 쓰기를 켠 버튼만 전용 값, 나머지는 공통 값)"""
+        if self.ses.sync_calib():
             try:
                 self.var_calib.set(self.cfg["calib_ms"])
             except Exception:
                 pass
             self.ctrl.save_cfg()
-            self.set_status(msg="영점 보정 %+.1f ms (그룹 %s)" % (self.cfg["calib_ms"], k))
+            m = self.ses.active_mode()
+            self.set_status(msg="영점 보정 %+.1f ms (%s)" % (self.cfg["calib_ms"], self.ses.calib_label(m)))
+        try:
+            m = self.ses.active_mode() or self.cfg.get("mode")
+            on = [k for k, v in self.var_split.items() if v.get()]
+            if on:
+                parts = ["공통 %+.1f" % self.ses.calib_common()] + [
+                    "%s %+.1f" % (k, self.ses.calib_for(k)) for k in on]
+                self.lbl_calib_src.configure(text="지금 %s 영점 사용 · %s" % (
+                    self.ses.calib_label(m) if m in ("4B", "5B", "6B", "8B") else "공통", " / ".join(parts)))
+            else:
+                self.lbl_calib_src.configure(text="모든 버튼이 같은 영점을 써요")
+        except Exception:
+            pass
+
+    def on_calib_split(self, m):
+        on = bool(self.var_split[m].get())
+        self.cfg.setdefault("calib_split", {})[m] = on
+        if on and m not in (self.cfg.get("calib_btn") or {}):
+            # 처음 켤 때는 지금 공통 값에서 시작
+            self.cfg.setdefault("calib_btn", {})[m] = round(self.ses.calib_common(), 1)
+        if "calib_common" not in self.cfg:
+            self.cfg["calib_common"] = float(self.cfg.get("calib_ms", 0.0))
+        self.ses.update_zero()
+        self._apply_zero_preset()
+        self.ctrl.save_cfg()
+        self.refresh()
 
     def on_reset(self):
         self.ses.reset()
@@ -1033,7 +1153,9 @@ class App(GraphDraw):
             self._banner_on = True
 
     def on_load(self):
-        p = filedialog.askopenfilename(initialdir=C.app_dir(), title="저장한 기록 불러오기",
+        from . import record
+        rd = record.record_dir(self.cfg)
+        p = filedialog.askopenfilename(initialdir=rd if os.path.isdir(rd) else C.app_dir(), title="저장한 기록 불러오기",
                                        filetypes=[("분석기 기록", "*.csv"), ("모든 파일", "*.*")])
         if not p:
             return
@@ -1054,6 +1176,10 @@ class App(GraphDraw):
 
     def on_game_calib(self):
         GameCalibDialog(self)
+
+    def on_coach(self):
+        """방금 끝난 곡의 오답노트 (곡이 끝난 뒤 계산 — 플레이 중 부하 없음)"""
+        CoachWindow(self)
 
     # ------------------------------------------------------------ 키 설정
     def on_keys(self):
@@ -1096,20 +1222,16 @@ class App(GraphDraw):
                                               "막대를 한 번 클릭한 뒤 방향키 1px, Shift+방향키 10px · 휠 = 폭")
             else:
                 t = "막대 양끝 ±%.0f ms (FAST/SLOW 범위 ±%.1f에 맞춰 자동)" % (bar_range(self.cfg, fs), fs)
-                short = ""
                 if self.obs is not None:
                     from .obs_server import obs_size
                     if self.obs.error:
                         t += "\nOBS: " + self.obs.error
-                        short = "OBS 오류 (펼쳐서 확인)"
                     elif self.obs.running:
                         w, h = obs_size(self.cfg)
                         con = " · 연결됨" if self.obs.hub and self.obs.hub.clients > 0 else ""
                         t += "\nOBS 주소 %s · 브라우저 소스 크기 %d × %d (크기 100%% = 원래 인디케이터와 같음, OBS에서 늘리거나 줄이지 말고 '크기 %%'로)%s" % (
                             self.obs.url, w, h, con)
-                        short = "OBS %s · %d × %d%s" % (self.obs.url, w, h, con)
                 self.lbl_range.configure(text=t)
-                self.lbl_adv.configure(text="" if self._adv_open else short)
         except Exception:
             pass
         s = self.ses.stats()
@@ -1165,7 +1287,13 @@ class App(GraphDraw):
             self._fill_tree(s, win)
             return
         mj = o["median_j"]                 # 판정 기준 중심 (보정값 포함)
-        self.lbl_fs.configure(text="FAST %d  ·  SLOW %d    (±%.1f ms 밖)" % (o["fast"], o["slow"], self.ses.fs_range()))
+        # FAST/SLOW 개수는 곡마다 0부터 (다른 줄은 모을수록 정확해지는 값이라 [초기화] 전까지 누적)
+        sf = self.ses.song_fs()
+        if sf is None:
+            self.lbl_fs.configure(text="이번 곡  FAST 0  ·  SLOW 0    (±%.1f ms 밖)" % self.ses.fs_range())
+        else:
+            self.lbl_fs.configure(text="이번 곡  FAST %d  ·  SLOW %d    (±%.1f ms 밖, %d노트)" % (
+                sf[0], sf[1], self.ses.fs_range(), sf[2]))
         side = "빠름" if mj < 0 else "느림"
         self.lbl_line.configure(
             text="나만의 판정선  %s ms  (%s)" % (fmt_ms(mj), side),
@@ -1178,7 +1306,10 @@ class App(GraphDraw):
             if delta == 0:
                 rec += "  (지금이 최적)"
         else:
-            rec = "추천  출력 타이밍 %+d  →  %.1f%%" % (out - delta, o["in_best"] * 100)
+            # 귀판정: 판정 타이밍은 그대로 두고, 출력 타이밍 = 판정 타이밍 + n 으로 알려 줌
+            ro = out - delta
+            rec = "추천  출력 타이밍 %+d  (= 판정 타이밍 %+d  %s %d)  →  %.1f%%" % (
+                ro, js, "+" if ro - js >= 0 else "−", abs(ro - js), o["in_best"] * 100)
             if delta == 0:
                 rec += "  (지금이 최적)"
         self.lbl_rec.configure(text=rec)
@@ -1189,7 +1320,8 @@ class App(GraphDraw):
         zs = ("영점 보정 %+.1f ms" % cb) if cb else "영점 보정 없음"
         lat = self.ses.lat[-50:]
         ls = ("    · 입력→표시 %.1f ms" % (sorted(lat)[len(lat) // 2])) if lat else ""
-        self.lbl_sync.configure(text="귀판정 싱크 (판정 − 출력) = %d ms    · %s%s" % (js - out, zs, ls))
+        self.lbl_sync.configure(text="귀판정 싱크: 지금 출력 = 판정 %s %d ms    · %s%s" % (
+            "+" if out - js >= 0 else "−", abs(out - js), zs, ls))
         self._draw_graph(s["hist"], win)
         self._fill_tree(s, win)
 
@@ -1350,10 +1482,9 @@ class GameCalibDialog:
         # 그룹별 (버튼 모드 × 게임 모드): 루머 확인용
         self.grp = tk.Label(top, text="", bg=BG, fg=FG, font=(FONT, 9), justify="left")
         self.grp.pack(padx=12, pady=(0, 4), anchor="w")
-        self.var_bygrp = tk.IntVar(value=1 if app.cfg.get("calib_by_group") else 0)
-        tk.Checkbutton(top, text="그룹별 영점 따로 쓰기 (버튼 모드·게임 모드가 바뀌면 그 그룹 값으로 자동 전환)",
-                       variable=self.var_bygrp, command=self.on_bygrp, bg=BG, fg=FG, selectcolor="#262a35",
-                       activebackground=BG, activeforeground=FG, font=(FONT, 9)).pack(padx=12, anchor="w")
+        tk.Label(top, text="버튼별로 영점을 따로 쓰려면 메인 창 [판정·영점] 탭의 '버튼별 영점 따로'에서 체크하세요. "
+                           "게임 모드마다 영점도 따로 기억해요.",
+                 bg=BG, fg=DIM, font=(FONT, 9)).pack(padx=12, anchor="w")
         b = tk.Frame(top, bg=BG)
         b.pack(padx=12, pady=(2, 4), anchor="w")
         for t, c in (("추천값 적용", self.apply), ("모은 곡 비우기", self.forget), ("보정 해제(0)", self.clear),
@@ -1373,11 +1504,13 @@ class GameCalibDialog:
 
     def _show(self, extra=""):
         ses, cfg = self.app.ses, self.app.cfg
-        z = ses.zero
+        m = ses.active_mode() or cfg.get("mode")
+        z = ses.zero_for(m)
         for i in self.tv.get_children():
             self.tv.delete(i)
-        best = z["best"] if z else None
         for i, r in enumerate(ses.results):
+            zr = ses.zero_for(r.get("mode"))
+            best = zr["best"] if zr else None
             self.tv.insert("", "end", iid=str(i), values=(
                 r.get("when", ""), r.get("mode", "") + {"래더": " 래더", "버서스 매치": " 버서스", "미션": " 미션"}.get(
                     r.get("gmode"), "") + {"hard": " 하드", "max": " 맥스", "custom": " 사용자"}.get(
@@ -1385,42 +1518,47 @@ class GameCalibDialog:
                 "-" if r.get("brk") is None else r["brk"], ses.predicted_out(r),
                 "-" if best is None else ses.predicted_out(r, best), "O" if r.get("use", True) else "-"))
         cb = float(cfg.get("calib_ms", 0.0))
+        src = ses.calib_label(m)
         if z is None or z.get("n", 0) < 1:
-            txt = "모은 곡 없음 · 지금 영점 보정 %+.1f ms" % cb
+            txt = "[%s] 모은 곡 없음 · 지금 영점 보정 %+.1f ms" % (src, cb)
+        elif z.get("ambiguous"):
+            txt = ("아직 정할 수 없어요: %s ms가 비슷하게 맞아요 (%d곡)\n"
+                   "'100%% 아닌 개수'만으로는 FAST 쪽으로 밀린 값과 SLOW 쪽으로 밀린 값을 못 가려요. "
+                   "곡을 더 모으거나, 게임 FAST/SLOW 표시를 켜고 치면 정해져요. 지금 %+.1f ms" % (
+                       " / ".join("%+.1f" % v for v in z["ambiguous"]), z["n"], cb))
         else:
             ok = "  ✔ 지금 값이 범위 안이에요" if z["lo"] <= cb <= z["hi"] else "  → 바꾸는 게 좋아요"
             few = "  (3곡 이상 모으면 믿을 만해요)" if z["n"] < 3 else ""
-            txt = "추천 영점 보정 %+.1f ms  (맞는 범위 %+.1f ~ %+.1f, %d곡)%s\n지금 %+.1f ms%s" % (
-                z["best"], z["lo"], z["hi"], z["n"], few, cb, ok)
+            txt = "[%s] 추천 영점 보정 %+.1f ms  (맞는 범위 %+.1f ~ %+.1f, %d곡)%s\n지금 %+.1f ms%s" % (
+                src, z["best"], z["lo"], z["hi"], z["n"], few, cb, ok)
+            if z.get("by_text"):
+                txt += "\n(개수만으론 %s ms도 맞았지만, 게임 FAST/SLOW 글자 방향으로 골랐어요)" % (
+                    " / ".join("%+.1f" % v for v in z.get("alt", [])))
         self.res.configure(text=(extra + "\n" if extra else "") + txt)
         self.grp.configure(text=self._group_text())
 
     def _group_text(self):
-        """그룹별 추천 영점과 맞는 범위. 범위가 서로 안 겹치는 그룹이 있으면 '차이 있음'"""
-        zg = getattr(self.app.ses, "zero_groups", {}) or {}
-        if not zg:
-            return "그룹별 (버튼 모드 · 게임 모드): 아직 없음 — 메인 창의 게임 모드를 맞춰 두고 치면 따로 모여요"
-        lines = ["그룹별 (버튼 모드 · 게임 모드, 노멀 판정 곡만):"]
-        pre = self.app.cfg.get("calib_presets") or {}
-        for k in sorted(zg):
-            z = zg[k]
-            p = pre.get(k)
-            lines.append("  %s : %+.1f ms (맞는 범위 %+.1f ~ %+.1f, %d곡)%s" % (
-                k, z["best"], z["lo"], z["hi"], z["n"], "  · 저장된 값 %+.1f" % p if p is not None else ""))
-        ok = [z for z in zg.values() if z["n"] >= 3]
+        """버튼별 추천 영점과 맞는 범위 (따로 쓰기 여부와 상관없이 비교용, 지금 게임 모드 곡만). 범위가 안 겹치면 '차이 있음'"""
+        ses = self.app.ses
+        zb = getattr(ses, "zero_btn", {}) or {}
+        if not zb:
+            return "버튼별: 아직 없음"
+        lines = ["버튼별 (%s · 노멀 판정 곡만):" % (self.app.cfg.get("game_mode") or "프리스타일")]
+        for k in ses.BTN_MODES:
+            z = zb.get(k)
+            if z is None:
+                continue
+            lines.append("  %s : %+.1f ms (맞는 범위 %+.1f ~ %+.1f, %d곡) · 지금 %s %+.1f%s" % (
+                k, z["best"], z["lo"], z["hi"], z["n"], "전용" if ses.calib_split_on(k) else "공통", ses.calib_for(k),
+                "  · 아직 못 정함 (%s)" % " / ".join("%+.1f" % v for v in z["ambiguous"]) if z.get("ambiguous") else ""))
+        ok = [z for z in zb.values() if z["n"] >= 3 and not z.get("ambiguous")]
         if len(ok) >= 2:
             sep = any(a["hi"] < b["lo"] or b["hi"] < a["lo"] for a in ok for b in ok)
-            lines.append("  → " + ("범위가 안 겹치는 그룹이 있어요: 차이가 있을 가능성이 높아요" if sep else
-                                   "3곡 이상 모인 그룹끼리 범위가 겹쳐요: 아직 차이가 보이지 않아요"))
+            lines.append("  → " + ("범위가 안 겹치는 버튼이 있어요: 버튼별로 따로 쓰는 게 나을 수 있어요" if sep else
+                                   "3곡 이상 모인 버튼끼리 범위가 겹쳐요: 같은 영점을 써도 돼요"))
         else:
-            lines.append("  → 비교하려면 그룹마다 3곡 이상 필요해요")
+            lines.append("  → 비교하려면 버튼마다 3곡 이상 필요해요")
         return "\n".join(lines)
-
-    def on_bygrp(self):
-        self.app.cfg["calib_by_group"] = bool(self.var_bygrp.get())
-        self.app.ctrl.save_cfg()
-        self.app._apply_zero_preset(force=True)
-        self._show()
 
     def toggle(self, ev=None):
         sel = self.tv.selection()
@@ -1434,30 +1572,23 @@ class GameCalibDialog:
         self._show()
 
     def _set(self, v):
-        cfg = self.app.cfg
-        cfg["calib_ms"] = round(v, 1)
-        cfg.setdefault("calib_by_capture", {})["thread" if cfg.get("capture_thread", True) else "old"] = cfg["calib_ms"]
+        self.app.ses.set_calib(v)
         self.app.ctrl.save_cfg()
         self.app.refresh()
 
     def apply(self):
         app = self.app
-        if app.cfg.get("calib_by_group"):
-            k = app.zero_key()
-            z = (getattr(app.ses, "zero_groups", {}) or {}).get(k)
-            if z is None:
-                self._show("지금 그룹(%s)에 모은 곡이 없어요." % k)
-                return
-            app.cfg.setdefault("calib_presets", {})[k] = round(z["best"], 1)
-            self._set(z["best"])
-            self._show("그룹 %s 영점 보정 %+.1f ms 저장·적용" % (k, z["best"]))
-            return
-        z = app.ses.zero
+        m = app.ses.active_mode() or app.cfg.get("mode")
+        src = app.ses.calib_label(m)
+        z = app.ses.zero_for(m)
         if z is None:
-            self._show("모은 곡이 없어요.")
+            self._show("[%s] 모은 곡이 없어요." % src)
+            return
+        if z.get("ambiguous"):
+            self._show("[%s] 아직 FAST 쪽/SLOW 쪽 값을 못 가려서 적용하지 않았어요." % src)
             return
         self._set(z["best"])
-        self._show("영점 보정 %+.1f ms 적용" % z["best"])
+        self._show("[%s] 영점 보정 %+.1f ms 적용" % (src, z["best"]))
 
     def manual(self):
         try:
@@ -1517,9 +1648,24 @@ class RecordViewer(GraphDraw):
         self.cvs = [tk.Canvas(top, width=560, height=150, bg="#101217", highlightthickness=0) for _ in range(2)]
         for c in self.cvs:
             c.pack(fill="x", padx=8, pady=2)
-        tk.Button(top, text="닫기", command=top.destroy, bg="#262a35", fg=FG, relief="flat",
-                  font=(FONT, 9), padx=8).pack(anchor="e", padx=8, pady=(2, 8))
+        fb = tk.Frame(top, bg=BG)
+        fb.pack(fill="x", padx=8, pady=(2, 8))
+        tk.Button(fb, text="닫기", command=top.destroy, bg="#262a35", fg=FG, relief="flat",
+                  font=(FONT, 9), padx=8).pack(side="right")
+        tk.Button(fb, text="이 곡 오답노트", command=self.on_coach, bg="#262a35", fg=FG, relief="flat",
+                  font=(FONT, 9), padx=8).pack(side="right", padx=4)
         top.after(80, self.draw)
+
+    def on_coach(self):
+        from . import coach
+        i = self.song_names.index(self.song_var.get()) if self.song_var.get() in self.song_names else len(self.songs) - 1
+        sg = self.songs[i]
+        try:
+            rep = coach.from_song(sg, self.cfg)
+        except Exception as ex:
+            messagebox.showerror("오답노트", "분석하지 못했어요: %r" % (ex,))
+            return
+        CoachWindow(self.app, rep=rep, cfg=self.cfg, title="불러온 곡 %d" % (i + 1))
 
     def draw(self):
         from .analysis import histogram
@@ -1547,3 +1693,101 @@ class RecordViewer(GraphDraw):
             self._draw_choice(g, self.cvs[0], self.cvs[1], win, hist, titles=True)
         except Exception as ex:
             self.lbl.configure(text="그래프 오류: %r" % (ex,))
+
+
+class CoachWindow:
+    """오답노트 창: 어디서 · 무엇이 틀렸나 · 부족한 점 · 이렇게 고치기 · 다음 목표"""
+
+    def __init__(self, app, rep=None, cfg=None, title=None):
+        from . import coach
+        self.app = app
+        self.coach = coach
+        self.cfg = cfg or app.cfg
+        rev = trend = pool = None
+        if rep is None:                      # 측정 중인 세션의 마지막 곡
+            ses = app.ses
+            try:
+                rep, st = coach.from_session(ses)
+            except Exception as ex:
+                rep, st = None, None
+                messagebox.showerror("오답노트", "분석하지 못했어요: %r" % (ex,))
+            adv = coach.advise(rep, self.cfg) if rep else []
+            if rep:
+                hist = getattr(ses, "coach_hist", None)
+                if hist is None:
+                    hist = ses.coach_hist = coach.load_history()
+                prev = None
+                for h in reversed(hist):
+                    if h.get("mode") == rep["mode"] and (st is None or h.get("start") is None
+                                                          or abs(h["start"] - st) >= 3000.0):
+                        prev = h
+                        break
+                coach.record(hist, rep, adv, judge=ses.judge_kind(), start_t=st)
+                coach.save_history(hist)
+                rev = coach.review(prev, rep, adv) if prev else None
+                trend, _ = coach.trend_advice(hist, rep["mode"])
+                pool = coach.pooled(hist, rep["mode"])
+            title = title or "방금 친 곡"
+        else:
+            adv = coach.advise(rep, self.cfg)
+            title = title or "불러온 곡"
+        self.lines = coach.report_text(rep, adv, self.cfg, trend=trend, title=title, rev=rev, pool=pool)
+
+        top = self.top = tk.Toplevel(app.root)
+        top.title("오답노트 - " + title)
+        top.configure(bg=BG)
+        top.geometry("680x760")
+        fr = tk.Frame(top, bg=BG)
+        fr.pack(fill="both", expand=True, padx=8, pady=(8, 2))
+        sb = tk.Scrollbar(fr)
+        sb.pack(side="right", fill="y")
+        tx = self.tx = tk.Text(fr, bg="#101217", fg=FG, wrap="word", relief="flat", padx=12, pady=10,
+                               yscrollcommand=sb.set, font=(FONT, 10), spacing2=2, cursor="arrow")
+        tx.pack(side="left", fill="both", expand=True)
+        sb.config(command=tx.yview)
+        tx.tag_configure("h", font=(FONT, 12, "bold"), foreground=OKC, spacing1=14, spacing3=4)
+        tx.tag_configure("t", font=(FONT, 11, "bold"), foreground=FG, spacing1=10, spacing3=2)
+        tx.tag_configure("p", font=(FONT, 10), foreground=FG, lmargin1=4, lmargin2=4)
+        tx.tag_configure("dim", font=(FONT, 9), foreground=DIM, lmargin1=4, lmargin2=4, spacing3=2)
+        tx.tag_configure("k", font=(FONT, 10), foreground=FG, tabs=(118,), lmargin1=8, lmargin2=126)
+        tx.tag_configure("klab", font=(FONT, 9, "bold"), foreground="#9ec3ff")
+        tx.tag_configure("row", font=(FONT, 9), foreground=FG, tabs=(190, 240, 300, 360, 470), lmargin1=8)
+        tx.tag_configure("rowh", font=(FONT, 9, "bold"), foreground=DIM, tabs=(190, 240, 300, 360, 470), lmargin1=8)
+        fb = tk.Frame(top, bg=BG)
+        fb.pack(fill="x", padx=8, pady=(2, 8))
+        tk.Button(fb, text="닫기", command=top.destroy, bg="#262a35", fg=FG, relief="flat",
+                  font=(FONT, 9), padx=8).pack(side="right")
+        self.btn_src = tk.Button(fb, text="근거 자료 보기", command=self.toggle_src, bg="#262a35", fg=FG,
+                                 relief="flat", font=(FONT, 9), padx=8)
+        self.btn_src.pack(side="right", padx=4)
+        tk.Label(fb, text="플레이 중에는 계산하지 않아요 (곡이 끝난 뒤에만)", bg=BG, fg=DIM,
+                 font=(FONT, 8)).pack(side="left")
+        self.src_on = False
+        self.render(self.lines)
+
+    def render(self, lines):
+        tx = self.tx
+        tx.configure(state="normal")
+        tx.delete("1.0", "end")
+        first_row = True
+        for row in lines:
+            st = row[0]
+            if st == "k":
+                lab, text = row[1], row[2]
+                tx.insert("end", (lab or "") + "\t", ("k", "klab"))
+                tx.insert("end", text + "\n", "k")
+            elif st == "row":
+                tag = "rowh" if first_row or row[1][1] == "노트" else "row"
+                first_row = False
+                tx.insert("end", "\t".join(row[1]) + "\n", tag)
+            else:
+                if st == "h":
+                    first_row = True
+                tx.insert("end", row[1] + "\n", st if st in ("h", "t", "p", "dim") else "p")
+        tx.configure(state="disabled")
+        tx.yview_moveto(0)
+
+    def toggle_src(self):
+        self.src_on = not self.src_on
+        self.btn_src.configure(text="오답노트로 돌아가기" if self.src_on else "근거 자료 보기")
+        self.render(self.coach.sources_text() if self.src_on else self.lines)

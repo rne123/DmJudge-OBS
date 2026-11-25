@@ -59,12 +59,16 @@ DEFAULTS = {
     "fs_ms": 41.67,              # FAST/SLOW 범위 (±ms). 이 밖이면 FAST/SLOW로 세고 인디케이터가 반짝임
     "dark_notes": False,         # 어두운/반투명 노트 스킨이면 켜기 (밝기 기준을 낮춤)
     "calib_ms": 0.0,             # 영점 보정값 ([게임 결과로 보정]에서 설정)
+    "calib_split": {},           # 버튼별 영점 따로 쓰기 {"4B": True, ...}: 켠 버튼은 calib_btn 값, 나머지는 calib_common
+    "calib_btn": {},             # 버튼별 영점 값 {"4B": 6.5, ...}
     "match_window_ms": 150,      # 키 입력과 노트를 짝지을 최대 거리 (게임은 ±127ms 입력도 SLOW로 판정함)
     "match_early_ms": 190,       # 일찍 친 쪽 최대 거리 (실측: 게임은 약 -185ms까지 FAST로 받음)
     "match_v": 5,
     "capture_bias_ms": 0.0,      # 캡처 지연 보정(고급)
     "chatter_ms": 25,
     "recent": 0,                 # 0 = 전체, N = 최근 N개만
+    "record_save": False,        # [기록 저장]: 곡이 끝나면 결과 화면 PNG + 그 곡 _raw.csv를 자동 저장
+    "record_dir": "",            # 비우면 프로그램 폴더의 '기록' 폴더
     "measure": "eye",            # eye(눈판정) / ear(귀판정)
     "focus_only": True,          # 게임 창(제목에 DJMAX) 또는 분석기 창이 맨 앞일 때만 키 기록
     "ui": {"alpha": 0.92, "geometry": ""},
