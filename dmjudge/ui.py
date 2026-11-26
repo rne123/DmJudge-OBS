@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import config as C
 from .keys_win import key_name
+from .result_ocr import summary as _rsum
 
 FONT = "Malgun Gothic"
 BG, FG, DIM = "#14161c", "#e8e8ea", "#8a8f99"
@@ -120,6 +121,16 @@ class GraphDraw:
             return float(v) if v not in (None, "") else float(win)
         except Exception:
             return float(win)
+
+    def _win100(self, win):
+        """게임의 100% 범위 (판정 단계·예상 점수용, FAST/SLOW 범위를 바꿔도 이 값은 그대로)"""
+        for c in (getattr(self.ses, "cfg", None), getattr(self, "cfg", None)):
+            try:
+                if c and c.get("window_ms") not in (None, ""):
+                    return float(c["window_ms"])
+            except Exception:
+                pass
+        return float(win)
 
     def _tpad(self):
         return self._title_pad
@@ -302,12 +313,14 @@ class GraphDraw:
         pk = int(np.argmax(d))
         return "%s · 평균 %.1f · 최고 %.0f 노트/초 (%d:%02d)" % (self._song_label(dur), avg, mx, pk // 60, pk % 60)
 
-    GRADE_NAMES = ["90%", "80%", "70%", "60%", "50%", "40%", "30%", "20%", "10%", "1%"]
+    GRADE_NAMES = ["90%", "80%", "70%", "60%", "50%", "40%", "30%", "20%", "10%", "1%", "BREAK"]
 
     def _draw_grades(self, win, cv):
-        win = self._fs(win)
-        """판정 단계: FAST/SLOW 범위(설정값)를 가운데(100%)로, 바깥으로 범위의 0.4배(기본 16.67ms = 1/60초)마다 한 단계씩
-        (게임의 MAX 90%, 80% … 와 같은 간격). 위 = 빠름, 아래 = 느림. 막대 길이 = 개수(제곱근 눈금)."""
+        """판정 단계: 게임의 100% 범위를 가운데로, 바깥으로 100% 범위의 0.4배(노멀 16.67ms = 1/60초)마다 한 단계씩
+        (게임의 MAX 90%, 80% … 1%, 그 밖은 BREAK). 위 = 빠름, 아래 = 느림. 막대 길이 = 개수(제곱근 눈금).
+        예상 점수: 만점 1,000,000을 노트 수로 나눠 판정 %만큼 (1%·BREAK = 0점)."""
+        from .analysis import grade_levels, judge_score
+        win = self._win100(win)
         cv.delete("all")
         W = cv_w(cv)
         H = int(cv["height"])
@@ -316,14 +329,10 @@ class GraphDraw:
             return "곡을 치면 판정 단계별 개수가 보여요"
         import numpy as np
         es = np.array([p[1] for p in pts])
-        step = float(win) * 0.4      # 기본(41.67)이면 1/60초(16.67ms) = 게임과 같음, 범위를 줄이면 같은 비율로 줄어듦
+        step = float(win) * 0.4      # 노멀(41.67)이면 1/60초(16.67ms), 하드·맥스는 같은 비율로 줄어듦
         nlv = len(self.GRADE_NAMES)
-        def level(e):
-            a = abs(e)
-            if a <= win:
-                return 0
-            return int(min(nlv, np.ceil((a - win) / step)))
-        lv = np.array([level(e) for e in es])
+        lv = grade_levels(es, win)
+        sc = judge_score(es, win)
         fast = [int(((lv == k) & (es < 0)).sum()) for k in range(1, nlv + 1)]
         slow = [int(((lv == k) & (es > 0)).sum()) for k in range(1, nlv + 1)]
         center = int((lv == 0).sum())
@@ -349,8 +358,8 @@ class GraphDraw:
             cv.create_text(L + max(2.0, bw(n)) + 4, y, text="%d (%.1f%%)" % (n, 100.0 * n / total) if n else "0",
                            fill=FG if n else DIM, font=(FONT, 7), anchor="w")
         cv.create_line(L, T, L, B, fill="#3a4050")
-        return "%s · FAST %d · 100%% %d · SLOW %d · 한 단계 %.2fms, 막대 길이는 제곱근 눈금" % (
-            self._song_label(dur), sum(fast), center, sum(slow), step)
+        return "%s · 예상 %.2f%% (%s점) · FAST %d · 100%% %d · SLOW %d · 한 단계 %.2fms, 막대 길이는 제곱근 눈금" % (
+            self._song_label(dur), sc["rate"], format(sc["score"], ","), sum(fast), center, sum(slow), step)
 
     def _draw_hist(self, hist, win, cv=None):
         cv = cv or self.cv
@@ -393,8 +402,8 @@ class App(GraphDraw):
                        "keys": "대기", "msg": "", "lc": None}
         root.title("디맥 판정 분석기" + (" (OBS판)" if self.obs_edition else ""))
         root.configure(bg=BG)
-        if not self.obs_edition:           # OBS판: 분석기 창도 게임 위에 강제로 올리지 않음 (보통 창)
-            root.attributes("-topmost", True)
+        # OBS판은 기본이 보통 창(게임 위에 강제로 올리지 않음). [설정]의 '분석기 창 항상 위'로 켤 수 있음
+        root.attributes("-topmost", bool(cfg["ui"].get("topmost", not self.obs_edition)))
         try:
             root.attributes("-alpha", float(cfg["ui"].get("alpha", 0.92)))
         except Exception:
@@ -766,11 +775,20 @@ class App(GraphDraw):
         sa.pack(side="left", padx=2)
         sa.bind("<Return>", lambda e: self.on_alpha())
         fs3.add(pf, 0, 10)
-        self.var_thr = tk.IntVar(value=1 if self.cfg.get("capture_thread", True) else 0)
-        fs3.add(tk.Checkbutton(fs3, text="새 캡처 방식", variable=self.var_thr, command=self.on_capture_thread, **ck), 4)
         self.var_focus = tk.IntVar(value=1 if self.cfg.get("focus_only", True) else 0)
         fs3.add(tk.Checkbutton(fs3, text="게임 창이 맨 앞일 때만 키 기록", variable=self.var_focus,
                                command=self.on_focus_only, **ck), 4)
+        self.var_top = tk.IntVar(value=1 if self.cfg["ui"].get("topmost", not self.obs_edition) else 0)
+        fs3.add(tk.Checkbutton(fs3, text="분석기 창 항상 위", variable=self.var_top, command=self.on_topmost, **ck), 4)
+        gf = tk.Frame(fs3, bg=BG)
+        self._lbl(gf, "기어 위치", 9).pack(side="left")
+        self.var_gear = tk.StringVar(value=self.cfg.get("gear_pos") or "가운데")
+        cg = ttk.Combobox(gf, textvariable=self.var_gear, values=list(C.GEAR_POS), state="readonly", width=6)
+        cg.pack(side="left", padx=4)
+        cg.bind("<<ComboboxSelected>>", lambda e: self.on_gear_pos())
+        fs3.add(gf, 0, 10)
+        self._hint(t_set, "기어 위치: 게임 설정의 기어 위치와 같게 고르세요. 위치마다 영역 보정을 따로 기억해요"
+                          "(처음 고른 위치는 화면 폭의 1/3만큼 옮겨서 시작 — 어긋나면 그 위치에서 [영역 보정]).")
 
         # 마지막에 보던 탭으로 열기
         try:
@@ -957,18 +975,6 @@ class App(GraphDraw):
         self.btn_move.configure(text="이동 끝" if on else "인디케이터 이동",
                                 bg=OKC if on else "#262a35", fg="#111" if on else FG)
 
-    def on_capture_thread(self):
-        """새 캡처 방식(캡처 전용 스레드가 프레임 시각 기록) 켜기/끄기 → 캡처 다시 시작"""
-        cb = self.cfg.setdefault("calib_by_capture", {})
-        cb["thread" if self.cfg.get("capture_thread", True) else "old"] = float(self.cfg.get("calib_ms", 0.0))
-        self.cfg["capture_thread"] = bool(self.var_thr.get())
-        # 캡처 방식마다 화면 시각 기준이 조금 다를 수 있어서 영점 보정값을 따로 기억
-        self.ses.set_calib(float(cb.get("thread" if self.cfg["capture_thread"] else "old", 0.0)))
-        self.ses.calib_songs = []
-        self.ctrl.save_cfg()
-        self.ses.log("capture_thread", int(self.cfg["capture_thread"]))
-        self.ctrl.restart_capture()
-
     def on_tab(self):
         """고른 탭을 기억해 두었다가 다음에 그 탭으로 연다"""
         try:
@@ -1017,6 +1023,26 @@ class App(GraphDraw):
         except Exception as e:
             messagebox.showerror("기록 폴더", "폴더를 열지 못했어요: %r" % (e,))
 
+    def on_topmost(self):
+        on = bool(self.var_top.get())
+        self.cfg["ui"]["topmost"] = on
+        try:
+            self.root.attributes("-topmost", on)
+        except Exception:
+            pass
+        self.ctrl.save_cfg()
+
+    def on_gear_pos(self):
+        new = self.var_gear.get()
+        dx = C.switch_gear_pos(self.cfg, new)
+        self.ctrl.save_cfg()
+        if self.indicator is not None:
+            self.indicator.update(force=True)
+        self.ctrl.restart_capture()
+        g = self.cfg.get("geometry") or {}
+        self.set_status(msg="기어 위치 %s: 영역 x %.0f ~ %.0f%s" % (
+            new, g.get("x0", 0), g.get("x1", 0), "" if not dx else " (%+.0f px 옮김)" % dx))
+
     def on_big(self):
         self.cfg["big_effects"] = bool(self.var_big.get())
         self.ctrl.save_cfg()
@@ -1036,6 +1062,16 @@ class App(GraphDraw):
         self.ses.rebuild()
         self.ctrl.restart_capture()
 
+    def sync_window_setting(self):
+        """100% 범위가 밖에서(플레이 화면 판정 띠) 바뀌었을 때 칸을 맞추고 저장"""
+        try:
+            self.var_win.set(float(self.cfg.get("window_ms", 125.0 / 3.0)))
+            self.var_winp.set(self._fs_preset_name(float(self.cfg["window_ms"])))
+        except Exception:
+            pass
+        self.ctrl.save_cfg()
+        self.refresh()
+
     def on_gmode(self):
         """게임 모드 = 프리셋: 판정·출력 타이밍과 영점을 그 모드에 저장된 값으로 바꿈"""
         new = self.var_gmode.get()
@@ -1046,12 +1082,18 @@ class App(GraphDraw):
             self.var_judge.set(int(self.cfg.get("judge_setting_ms", 0)))
             self.var_out.set(int(self.cfg.get("output_setting_ms", 0)))
             self.var_calib.set(round(float(self.cfg.get("calib_ms", 0.0)), 1))
+            self.var_win.set(float(self.cfg.get("window_ms", 125.0 / 3.0)))
+            self.var_winp.set(self._fs_preset_name(float(self.cfg.get("window_ms", 125.0 / 3.0))))
+            if self.cfg.get("fs_ms") not in (None, ""):
+                self.var_fs.set(float(self.cfg["fs_ms"]))
+                self.var_fsp.set(self._fs_preset_name(float(self.cfg["fs_ms"])))
         except Exception:
             pass
         self.ses.suggest = None
         self.ctrl.save_cfg()
-        self.set_status(msg="%s 설정: 판정 타이밍 %+d · 출력 타이밍 %+d · 영점 보정 %+.1f ms" % (
-            new, int(self.cfg.get("judge_setting_ms", 0)), int(self.cfg.get("output_setting_ms", 0)),
+        self.set_status(msg="%s 설정: %s · 판정 타이밍 %+d · 출력 타이밍 %+d · 영점 보정 %+.1f ms" % (
+            new, self._fs_preset_name(float(self.cfg.get("window_ms", 125.0 / 3.0))),
+            int(self.cfg.get("judge_setting_ms", 0)), int(self.cfg.get("output_setting_ms", 0)),
             float(self.cfg.get("calib_ms", 0.0))))
         self.refresh()
 
@@ -1200,7 +1242,7 @@ class App(GraphDraw):
 
     def refresh(self):
         try:
-            self._apply_zero_preset()
+            self._apply_zero_preset()      # 버튼 모드가 바뀌면 그 버튼의 영점으로 (인디케이터에 쓰이므로 치는 중에도)
         except Exception:
             pass
         try:
@@ -1292,27 +1334,34 @@ class App(GraphDraw):
         if sf is None:
             self.lbl_fs.configure(text="이번 곡  FAST 0  ·  SLOW 0    (±%.1f ms 밖)" % self.ses.fs_range())
         else:
-            self.lbl_fs.configure(text="이번 곡  FAST %d  ·  SLOW %d    (±%.1f ms 밖, %d노트)" % (
-                sf[0], sf[1], self.ses.fs_range(), sf[2]))
+            t = "이번 곡  FAST %d  ·  SLOW %d    (±%.1f ms 밖, %d노트)" % (sf[0], sf[1], self.ses.fs_range(), sf[2])
+            sc = sf[3] if len(sf) > 3 else None
+            if sc:
+                t += "    예상 %.2f%% (%s점)" % (sc["rate"], format(sc["score"], ","))
+            self.lbl_fs.configure(text=t)
         side = "빠름" if mj < 0 else "느림"
         self.lbl_line.configure(
             text="나만의 판정선  %s ms  (%s)" % (fmt_ms(mj), side),
             fg=EARLY if mj < -2 else LATE if mj > 2 else FG)
         self.lbl_spread.configure(text="흔들림  ±%.1f ms    (화면 기준 평균 %s ms)" % (o["robust_std"], fmt_ms(o["mean_e"])))
-        self.lbl_in.configure(text="±%.1f ms 안  %.1f%%    (n=%d)" % (win, o["in_now"] * 100, o["n"]))
-        delta = o["best_setting"] - js
-        if self.cfg.get("measure", "eye") == "eye":
-            rec = "추천  판정 타이밍 %+d  →  %.1f%%" % (o["best_setting"], o["in_best"] * 100)
-            if delta == 0:
-                rec += "  (지금이 최적)"
+        self.lbl_in.configure(text="[초기화] 뒤 모은 기록 전체  예상 %.2f%%    (%d노트)" % (o.get("rate_now", 0.0), o["n"]))
+        def rec_txt(oo):
+            d_ = oo["best_setting"] - js
+            if self.cfg.get("measure", "eye") == "eye":
+                t_ = "판정 타이밍 %+d  →  예상 %.2f%%" % (oo["best_setting"], oo.get("rate_best", 0.0))
+            else:
+                # 귀판정: 판정 타이밍은 그대로 두고, 출력 타이밍 = 판정 타이밍 + n 으로 알려 줌
+                ro = out - d_
+                t_ = "출력 타이밍 %+d (= 판정 %+d %s %d)  →  예상 %.2f%%" % (
+                    ro, js, "+" if ro - js >= 0 else "−", abs(ro - js), oo.get("rate_best", 0.0))
+            return t_ + ("  (지금이 최적)" if d_ == 0 else "")
+        so = s.get("song")
+        if so and so.get("n") and "best_setting" in so:
+            l1 = "추천  이 곡   " + rec_txt(so)
         else:
-            # 귀판정: 판정 타이밍은 그대로 두고, 출력 타이밍 = 판정 타이밍 + n 으로 알려 줌
-            ro = out - delta
-            rec = "추천  출력 타이밍 %+d  (= 판정 타이밍 %+d  %s %d)  →  %.1f%%" % (
-                ro, js, "+" if ro - js >= 0 else "−", abs(ro - js), o["in_best"] * 100)
-            if delta == 0:
-                rec += "  (지금이 최적)"
-        self.lbl_rec.configure(text=rec)
+            l1 = "추천  이 곡   (곡이 끝나면 계산)"
+        l2 = "추천  누적    " + rec_txt(o) + ("    (곡 끝나면 다시 계산)" if o.get("rec_stale") else "")
+        self.lbl_rec.configure(text=l1 + "\n" + l2)
         self.lbl_margin.configure(text="추천값 적용 시 여유: 빠른 쪽 %.0f ms / 느린 쪽 %.0f ms%s" % (
             o["margin_early"], o["margin_late"],
             "   ⚠ 흔들림이 커서 설정만으로는 다 못 넣어요" if o["robust_std"] > win / 2 else ""))
@@ -1471,8 +1520,8 @@ class GameCalibDialog:
         tk.Label(top, text=msg, bg=BG, fg=FG, font=(FONT, 10), justify="left").pack(padx=12, pady=(10, 6), anchor="w")
         cols = ("when", "mode", "n", "game", "brk", "now", "rec", "use")
         tv = self.tv = ttk.Treeview(top, columns=cols, show="headings", height=9)
-        for c, t, w in zip(cols, ("시각", "모드", "노트", "게임 100%아님", "BREAK", "분석기(지금)", "분석기(추천)", "계산"),
-                           (88, 96, 52, 96, 54, 84, 84, 44)):
+        for c, t, w in zip(cols, ("시각", "모드", "노트", "게임 100%아님(래더=점수)", "BREAK", "분석기(지금)", "분석기(추천)", "계산"),
+                           (88, 96, 52, 150, 54, 96, 96, 44)):
             tv.heading(c, text=t)
             tv.column(c, width=w, anchor="center")
         tv.pack(padx=12, pady=4, fill="x")
@@ -1511,12 +1560,18 @@ class GameCalibDialog:
         for i, r in enumerate(ses.results):
             zr = ses.zero_for(r.get("mode"))
             best = zr["best"] if zr else None
+            if r.get("non100") is None and r.get("score") is not None:
+                # 래더: 단계별 개수가 없어 점수로 비교 (게임 점수 / 지금 영점일 때 예상 점수 / 추천값일 때 예상 점수)
+                g_, now_, rec_ = "%s점" % format(r["score"], ","), "%s점" % format(ses.predicted_score(r) or 0, ","), \
+                    "-" if best is None else "%s점" % format(ses.predicted_score(r, best) or 0, ",")
+            else:
+                g_, now_ = r["non100"], ses.predicted_out(r)
+                rec_ = "-" if best is None else ses.predicted_out(r, best)
             self.tv.insert("", "end", iid=str(i), values=(
                 r.get("when", ""), r.get("mode", "") + {"래더": " 래더", "버서스 매치": " 버서스", "미션": " 미션"}.get(
                     r.get("gmode"), "") + {"hard": " 하드", "max": " 맥스", "custom": " 사용자"}.get(
-                    r.get("judge", "normal"), ""), r.get("n", ""), r["non100"],
-                "-" if r.get("brk") is None else r["brk"], ses.predicted_out(r),
-                "-" if best is None else ses.predicted_out(r, best), "O" if r.get("use", True) else "-"))
+                    r.get("judge", "normal"), ""), r.get("n", ""), g_,
+                "-" if r.get("brk") is None else r["brk"], now_, rec_, "O" if r.get("use", True) else "-"))
         cb = float(cfg.get("calib_ms", 0.0))
         src = ses.calib_label(m)
         if z is None or z.get("n", 0) < 1:
@@ -1543,7 +1598,7 @@ class GameCalibDialog:
         zb = getattr(ses, "zero_btn", {}) or {}
         if not zb:
             return "버튼별: 아직 없음"
-        lines = ["버튼별 (%s · 노멀 판정 곡만):" % (self.app.cfg.get("game_mode") or "프리스타일")]
+        lines = ["버튼별 (%s · 노멀·하드·맥스 곡, 곡마다 그 판정 범위로):" % (self.app.cfg.get("game_mode") or "프리스타일")]
         for k in ses.BTN_MODES:
             z = zb.get(k)
             if z is None:
@@ -1628,7 +1683,7 @@ class RecordViewer(GraphDraw):
         for i, sg in enumerate(songs):
             d = (sg["end"] - sg["start"]) / 1000.0
             r = sg.get("result")
-            rs = (" · 결과 100%%아님 %d, BREAK %d" % (sum(r[1:11]), r[11])) if r else ""
+            rs = (" · 결과 100%%아님 %d, BREAK %d" % _rsum(r)[1:]) if r else ""
             self.song_names.append("%d. %s · %d:%02d · %d노트%s" % (i + 1, sg["mode"], int(d) // 60, int(d) % 60, sg["n"], rs))
         self.song_var = tk.StringVar(value=self.song_names[-1])
         cb = ttk.Combobox(f, textvariable=self.song_var, values=self.song_names, state="readonly", width=48, font=(FONT, 9))
@@ -1645,6 +1700,11 @@ class RecordViewer(GraphDraw):
         self.lbl = tk.Label(top, text="", bg=BG, fg=FG, font=(FONT, 10), anchor="nw", justify="left",
                             width=1, height=2, wraplength=600)
         self.lbl.pack(fill="x", padx=8, pady=2)
+        # 판정선 추천 (저장된 기록만으로: 그때 설정 기준 예상 점수 / 판정 타이밍을 바꾸면)
+        self.lbl_rec = tk.Label(top, text="", bg=BG, fg=OKC, font=(FONT, 10, "bold"), anchor="nw", justify="left",
+                                width=1, height=2, wraplength=600)
+        self.lbl_rec.pack(fill="x", padx=8, pady=(0, 2))
+        self._rec_all = None
         self.cvs = [tk.Canvas(top, width=560, height=150, bg="#101217", highlightthickness=0) for _ in range(2)]
         for c in self.cvs:
             c.pack(fill="x", padx=8, pady=2)
@@ -1655,6 +1715,29 @@ class RecordViewer(GraphDraw):
         tk.Button(fb, text="이 곡 오답노트", command=self.on_coach, bg="#262a35", fg=FG, relief="flat",
                   font=(FONT, 9), padx=8).pack(side="right", padx=4)
         top.after(80, self.draw)
+
+    def _rec_of(self, sgs):
+        """곡들의 기록 → (그때 판정 타이밍, summarize 결과). 판정 타이밍·영점은 곡을 칠 때 값, 100% 범위는 기록의 설정"""
+        from .analysis import summarize
+        import numpy as np
+        win = float(self.cfg.get("window_ms", 125.0 / 3.0))
+        js = float(sgs[-1]["js"])
+        # 곡마다 판정 타이밍·영점이 달랐을 수 있어서, 마지막 곡의 설정 기준 화면 오차로 맞춰 합침
+        e = np.concatenate([np.array([h[3] for h in sg["hits"]], float) + (sg["js"] + sg["calib"]) - (js + sgs[-1]["calib"])
+                            for sg in sgs])
+        return js, summarize(e, js, win, float(sgs[-1]["calib"]), win)
+
+    def _rec_text(self, sg):
+        js, o = self._rec_of([sg])
+        t = "이 곡: 그때 판정 타이밍 %+d → 예상 %.2f%%   ·   추천 판정 타이밍 %+d → 예상 %.2f%%" % (
+            js, o["rate_now"], o["best_setting"], o["rate_best"])
+        if len(self.songs) > 1:
+            if self._rec_all is None:
+                self._rec_all = self._rec_of(self.songs)
+            ja, oa = self._rec_all
+            t += "\n이 기록의 %d곡 합쳐서: 추천 판정 타이밍 %+d → 예상 %.2f%%  (지금 %+d → %.2f%%)" % (
+                len(self.songs), oa["best_setting"], oa["rate_best"], ja, oa["rate_now"])
+        return t
 
     def on_coach(self):
         from . import coach
@@ -1676,10 +1759,20 @@ class RecordViewer(GraphDraw):
         e = self.ses.judge_errors()
         nf, ns = int((e < -win).sum()), int((e > win).sum())
         r = sg.get("result")
-        gtxt = ("   ·   게임: 100%% 아님 %d, BREAK %d" % (sum(r[1:11]), r[11])) if r else ""
+        gtxt = ("   ·   게임: 100%% 아님 %d, BREAK %d" % _rsum(r)[1:]) if r else ""
+        from .analysis import score_from_counts
+        gs = score_from_counts(r) if r else None
+        if not r and sg.get("lscore") is not None:
+            gtxt = "   ·   게임(래더): %s점" % format(sg["lscore"], ",")
+        if gs:
+            gtxt += " → %.2f%% (%s점)" % (gs["rate"], format(gs["score"], ","))
         import numpy as np
         self.lbl.configure(text="분석기: FAST %d · SLOW %d (±%.2f 밖) · 중앙 %+.1f ms · 흔들림 ±%.1f%s" % (
             nf, ns, win, float(np.median(e)), float(np.subtract(*np.percentile(e, [84, 16])) / 2), gtxt))
+        try:
+            self.lbl_rec.configure(text=self._rec_text(sg))
+        except Exception as ex:
+            self.lbl_rec.configure(text="추천 계산 오류: %r" % (ex,))
         g = self.graph_var.get()
         hist = histogram(e)
         for c in self.cvs:

@@ -255,19 +255,40 @@ def _run(q, stop_evt, cfg, cmd_q=None):
     proc = []
     last_arr = None
     guessed = None
-    threaded = bool(cfg.get("capture_thread", True))
-    grabber = None
-    if threaded:
-        import sys
-        sys.setswitchinterval(0.0005)        # 분석 중에도 캡처 스레드가 바로 깨어나게
-        grabber = Grabber(lambda: cam.grab(region=region))
-        grabber.full_fn = lambda: cam.grab()
-        grabber.start()
+    threaded = True                          # 캡처는 늘 별도 스레드 (예전 방식은 v0.4.6에서 없앰)
+    import sys
+    sys.setswitchinterval(0.0005)            # 분석 중에도 캡처 스레드가 바로 깨어나게
+    grabber = Grabber(lambda: cam.grab(region=region))
+    grabber.full_fn = lambda: cam.grab()
+    grabber.start()
     seq, skipped = 0, 0
     last_fs_t = -1e9
     # 곡 끝 → 결과 화면 숫자 읽기: 노트(확실한 도달)가 100개 넘게 나온 뒤 1.5초 넘게 끊기면 0.4초마다 전체 화면 확인
-    from .result_ocr import read as read_result
-    rs = {"n": 0, "last": None, "next": 0.0, "prev": None}
+    from .result_ocr import read as read_result, read_mission, read_ladder, read_judge_badge
+    rs = {"n": 0, "last": None, "next": 0.0, "prev": None, "jtry": 0, "jwait": False}
+    # 래더·버서스: 곡 첫 노트 때 전체 화면 한 장으로 'HARD JUDGEMENT' 띠 확인 (곡마다 최대 3번, 프레임 1장만 씀)
+    J_AT = (1, 40, 120)
+
+    def check_judge():
+        if rs["jtry"] >= len(J_AT) or rs["n"] < J_AT[rs["jtry"]]:
+            return
+        if rs["jwait"]:
+            if grabber.full is None:
+                return
+            full, grabber.full = grabber.full, None
+            rs["jwait"] = False
+            try:
+                kind = read_judge_badge(full)
+            except Exception:
+                kind = None
+            if kind is not None:
+                q.put(("judge", kind, time.perf_counter() * 1000.0))
+                rs["jtry"] = len(J_AT)
+            else:
+                rs["jtry"] += 1
+        elif not grabber.full_req:
+            grabber.full_req = True
+            rs["jwait"] = True
     # [기록 저장]이 켜져 있으면 확정된 결과 화면 한 장을 메인으로 넘긴다 (곡이 끝난 뒤 한 번, 플레이 중 부하 없음)
     rec = {"on": bool(cfg.get("record_save", False))}
 
@@ -289,50 +310,46 @@ def _run(q, stop_evt, cfg, cmd_q=None):
         if rs["n"] < 100 or rs["last"] is None or now - rs["last"] < 1500.0:
             return
         if now - rs["last"] > 120000.0:          # 2분 넘게 결과 화면을 못 찾으면 포기
-            rs["n"] = 0
+            rs["n"], rs["jtry"] = 0, 0
             return
         full = None
-        if grabber is not None:
-            if grabber.full is not None:
-                full, grabber.full = grabber.full, None
-            elif now >= rs["next"] and not grabber.full_req:
-                grabber.full_req = True
-                rs["next"] = now + 400.0
-        elif now >= rs["next"]:
+        if grabber.full is not None:
+            full, grabber.full = grabber.full, None
+        elif now >= rs["next"] and not grabber.full_req:
+            grabber.full_req = True
             rs["next"] = now + 400.0
-            full = cam.grab()
         if full is None:
             return
+        kind = "result"
         try:
             vals = read_result(full)
+            if vals is None:
+                vals = read_mission(full)          # 미션 모드 결과 화면 (MAX 100% / 1~90% / BREAK만)
+            if vals is None:
+                lv = read_ladder(full)             # 래더 대기 화면 (라운드 점수만)
+                if lv is not None:
+                    kind, vals = "lresult", lv
         except Exception:
             vals = None
         if vals is None:
             rs["prev"] = None
             return
         if vals == rs["prev"]:                  # 숫자가 올라가는 애니메이션이 끝나 두 번 연속 같을 때 확정
-            q.put(("result", vals, now, full if rec["on"] else None))
-            rs["n"], rs["prev"] = 0, None
+            q.put((kind, vals, now, full if rec["on"] else None))
+            rs["n"], rs["prev"], rs["jtry"] = 0, None, 0
         else:
             rs["prev"] = vals
 
     while not stop_evt.is_set():
         check_result()
-        if grabber is not None:
-            got_f = grabber.get(seq)
-            if got_f is None:
-                continue
-            seq, frame, tf, sk = got_f
-            skipped += sk
-            t0 = time.perf_counter()
-            t = tf * 1000.0 + bias
-        else:
-            frame = cam.grab(region=region)
-            if frame is None:
-                time.sleep(0.0005)
-                continue
-            t0 = time.perf_counter()
-            t = t0 * 1000.0 + bias
+        check_judge()
+        got_f = grabber.get(seq)
+        if got_f is None:
+            continue
+        seq, frame, tf, sk = got_f
+        skipped += sk
+        t0 = time.perf_counter()
+        t = tf * 1000.0 + bias
         got = False
         gate = jwatch.ended          # 곡이 끝나 판정선이 없는 동안: 화면에 잡히는 것은 노트로 치지 않음 (결과 화면 전환 그림 등)
         n_gated = 0                  # 그동안 버린 확실한 도달 수 (꾸준히 나오면 곡이 다시 시작된 것으로 봄)
@@ -370,6 +387,7 @@ def _run(q, stop_evt, cfg, cmd_q=None):
                 rs["last"] = min(rs["last"], time.perf_counter() * 1000.0 - 1500.0)
         elif jev == "start":
             q.put(("songstart", t))
+            rs["jtry"], rs["jwait"] = 0, False
         for kind, te in fstext.feed(frame, t):
             q.put(("fstext", kind, te))
             last_fs_t = te
@@ -411,9 +429,8 @@ def _run(q, stop_evt, cfg, cmd_q=None):
             p95 = sorted(proc)[int(len(proc) * 0.95)] if proc else 0.0
             q.put(("cap", fps, tr0.speed or 0.0, tr0.head_h, p95, skipped, threaded))
             n, t_rep, proc, skipped = 0, now, [], 0
-    if grabber is not None:
-        grabber.stop = True
-        grabber.th.join(timeout=1)
+    grabber.stop = True
+    grabber.th.join(timeout=1)
     try:
         del cam
     except Exception:

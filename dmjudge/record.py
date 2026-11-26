@@ -6,7 +6,7 @@
   · 확실하지 않으면 파일 이름 앞에 '확인필요_'를 붙이고 가장 비슷한 후보 이름을 쓴다.
 - 난이도: 결과 화면 제목 아래 배지(NORMAL/HARD/MAXIMUM/SC)의 글자 폭과 색으로 판별한다.
 - 버튼: 분석기가 판별한 모드(4B/5B/6B/8B)를 쓴다.
-- 저장 이름: 제목_6B_SC_20261125_2001.png / 같은 이름_raw.csv ([기록 불러오기]로 다시 열 수 있음)
+- 저장 이름: 제목_6B_SC_20261125_2001.jpg / 같은 이름_raw.csv ([기록 불러오기]로 다시 열 수 있음)
 """
 from __future__ import annotations
 
@@ -55,9 +55,14 @@ def difficulty(g):
 
 
 # ------------------------------------------------------------ 글자 영역 (OCR에 넘길 그림)
-def title_masked(g):
+TITLE_ROI = (10, 52, 772, 1500)              # 일반 결과 화면: 맨 위 가운데
+MISSION_TITLE_ROI = (292, 358, 155, 760)      # 미션 결과 화면: 왼쪽 'UniVerse MISSION' 아래 큰 글자 = 미션 이름 (곡 제목 아님)
+
+
+def title_masked(g, roi_=TITLE_ROI):
     """제목(흰 글자)만 남긴 검은 글자/흰 바탕, 3배 확대"""
-    roi = g[10:52, 772:1500]
+    y0, y1, x0, x1 = roi_
+    roi = g[y0:y1, x0:x1]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     m = ((hsv[..., 2] > 185) & (hsv[..., 1] < 70)).astype(np.uint8) * 255
     cols = np.where(m.sum(0) > 0)[0]
@@ -74,8 +79,9 @@ def _gray(roi):
     return cv2.copyMakeBorder(r, 20, 20, 20, 20, cv2.BORDER_REPLICATE)
 
 
-def title_gray(g):
-    return _gray(g[10:52, 772:1500])
+def title_gray(g, roi_=TITLE_ROI):
+    y0, y1, x0, x1 = roi_
+    return _gray(g[y0:y1, x0:x1])
 
 
 def composer_gray(g):
@@ -173,17 +179,59 @@ def ocr_windows(images, timeout=20.0):
             pass
 
 
+def ladder_title_img(g, bar_y):
+    """래더 대기 화면: ROUND 띠 바로 아래 흰 칸의 곡 제목(검은 글자) — 명암만 늘려 3배 확대"""
+    y0, y1 = bar_y + 30, bar_y + 55
+    r = cv2.cvtColor(g[y0:y1, 800:1120], cv2.COLOR_BGR2GRAY)
+    r = cv2.normalize(r, None, 0, 255, cv2.NORM_MINMAX)
+    r = cv2.resize(r, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    return cv2.copyMakeBorder(r, 20, 20, 20, 20, cv2.BORDER_REPLICATE)
+
+
+def identify_ladder(g, button, bar_y, ocr=ocr_windows):
+    """래더 대기 화면 → identify와 같은 dict (난이도는 안 읽음)"""
+    info = {"diff": None, "title": None, "song": None, "sure": False, "texts": None, "ladder": True}
+    im = ladder_title_img(g, bar_y)
+    res = ocr([im, 255 - im])
+    if not res or len(res) < 2:
+        return info
+    titles = [t for t in res[0] + res[1] if t and t.strip()]
+    info["texts"] = (titles, [])
+    best, cand = None, None
+    for t in titles:
+        b = songs.best(t, None, button, None)
+        if b is not None and (best is None or b[1] > best[1]):
+            best = b
+        m = songs.match(t, None, button, None, 1)
+        if m and (cand is None or m[0][1] > cand[1]):
+            cand = m[0]
+    if best is not None:
+        info.update(song=best[0], title=best[0]["name"], sure=True)
+    elif cand is not None and cand[1] >= 0.5:
+        info.update(song=cand[0], title=cand[0]["name"])
+    elif titles:
+        info["title"] = max(titles, key=len)
+    return info
+
+
 def identify(g, button, ocr=ocr_windows):
     """1080p 결과 화면 → {"diff", "title", "song", "sure", "texts"}.
     sure=False면 song은 가장 비슷한 후보(없을 수도 있음)."""
-    diff = difficulty(g)
-    info = {"diff": diff, "title": None, "song": None, "sure": False, "texts": None}
-    res = ocr([title_masked(g), title_gray(g), composer_gray(g)])
+    from .result_ocr import read_mission
+    mission = read_mission(g, need_1080=False) is not None     # 미션 결과 화면: 제목 위치가 다르고 난이도 배지·작곡가가 없음
+    diff = None if mission else difficulty(g)
+    info = {"diff": diff, "title": None, "song": None, "sure": False, "texts": None, "mission": mission}
+    roi_ = MISSION_TITLE_ROI if mission else TITLE_ROI
+    res = ocr([title_masked(g, roi_), title_gray(g, roi_), composer_gray(g)])
     if not res or len(res) < 3:
         return info
     titles = [t for t in res[0] + res[1] if t and t.strip()]
     comps = [t for t in res[2] if t and t.strip()]
     info["texts"] = (titles, comps)
+    if mission:                              # 미션 결과 화면엔 곡 제목이 없고 미션 이름만 있음 → 곡 목록과 맞추지 않음
+        if titles:
+            info.update(title="미션_" + max(titles, key=len).strip(), sure=True)
+        return info
     comp = max(comps, key=len) if comps else None
     best, cand = None, None
     for t in titles:                         # 언어·그림마다 읽은 글자 중 DB와 가장 잘 맞는 것
@@ -245,7 +293,7 @@ def record_dir(cfg):
 
 def _unique(base):
     p, k = base, 2
-    while os.path.exists(p + ".png") or os.path.exists(p + "_raw.csv"):
+    while os.path.exists(p + ".jpg") or os.path.exists(p + ".png") or os.path.exists(p + "_raw.csv"):
         p = "%s_%d" % (base, k)
         k += 1
     return p
@@ -266,10 +314,11 @@ def blank_cover(frame, cover, monitor=0):
     return out
 
 
-def save_song(frame, rows, cfg, button, when=None, ocr=ocr_windows, cover=None):
-    """결과 화면 + 곡 기록 저장. 반환: (저장한 파일 이름(확장자 없음), 정보 dict)"""
+def save_song(frame, rows, cfg, button, when=None, ocr=ocr_windows, cover=None, ladder=None):
+    """결과 화면 + 곡 기록 저장. 반환: (저장한 파일 이름(확장자 없음), 정보 dict)
+    ladder: 래더 대기 화면에서 읽은 {"score", "round", "bar_y"} (결과 화면 대신 이 화면을 저장)"""
     g = to_1080(blank_cover(frame, cover, cfg.get("monitor", 0)))
-    info = identify(g, button, ocr)
+    info = identify_ladder(g, button, ladder["bar_y"], ocr) if ladder else identify(g, button, ocr)
     d = record_dir(cfg)
     os.makedirs(d, exist_ok=True)
     title = info["title"] or "곡이름모름"
@@ -279,11 +328,17 @@ def save_song(frame, rows, cfg, button, when=None, ocr=ocr_windows, cover=None):
     if not info["sure"]:
         name = "확인필요_" + name
     stamp = time.strftime("%Y%m%d_%H%M", time.localtime(when or time.time()))
-    parts = [name, button or "모드모름", info["diff"] or "난이도모름", stamp]
+    if info.get("mission"):                   # 미션_미션이름_6B_날짜
+        parts = [name, button or "모드모름", stamp]
+    elif info.get("ladder"):                  # 곡이름_4B_래더_날짜
+        parts = [name, button or "모드모름", "래더", stamp]
+    else:
+        parts = [name, button or "모드모름", info["diff"] or "난이도모름", stamp]
     base = _unique(os.path.join(d, "_".join(parts)))
-    ok, buf = cv2.imencode(".png", frame)
+    # JPG 품질 92: PNG(약 1.4MB)의 1/4쯤(300KB대), 숫자·글자 읽기는 PNG와 똑같이 됨 (85로 낮추면 결과 화면 숫자를 못 읽는 경우가 있음)
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
     if ok:
-        with open(base + ".png", "wb") as f:      # 한글 경로도 되게 (cv2.imwrite는 한글 경로에서 실패)
+        with open(base + ".jpg", "wb") as f:      # 한글 경로도 되게 (cv2.imwrite는 한글 경로에서 실패)
             f.write(buf.tobytes())
     write_raw(base + "_raw.csv", cfg, rows)
     if info.get("song") is not None and info["diff"] and button:

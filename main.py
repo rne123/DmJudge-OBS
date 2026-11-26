@@ -71,6 +71,7 @@ def main():
                 g = run_calibration(cfg, lambda: grab_fullscreen(cfg.get("monitor", 0)))
                 if g:
                     cfg["geometry"] = g
+                    cfg.setdefault("geometry_by_pos", {})[cfg.get("gear_pos") or "가운데"] = dict(g)
                     C.save(cfg)
                     app.set_status(msg="")
             except Exception as e:
@@ -191,11 +192,33 @@ def main():
                         z = ses.zero
                         zt = ("  · 영점 보정 추천 %+.1f (%d곡)" % (z["best"], z["n"])) if z and z.get("n", 0) >= 3 else \
                              ("  · 영점 추천까지 %d곡 더" % (3 - len(ses.results))) if len(ses.results) < 3 else ""
-                        app.set_status(msg="결과 화면 읽음: MAX 100%% %d · 100%% 아님 %d · BREAK %d  (분석기 범위 밖 %d)%s" % (
-                            rec["game"][0], rec["non100"], rec["brk"], ses.predicted_out(rec), zt))
+                        mt = ""
+                        if rec.get("mission"):
+                            mt = "  · 미션 곡(하드 판정)으로 저장" + ("" if cfg.get("game_mode") == "미션" else
+                                                               " — 게임 모드를 [미션]으로 바꾸면 미션 곡들로 영점을 추천해요")
+                        app.set_status(msg="결과 화면 읽음: MAX 100%% %d · 100%% 아님 %d · BREAK %d  (분석기 범위 밖 %d)%s%s" % (
+                            rec["game"][0], rec["non100"], rec["brk"], ses.predicted_out(rec), zt, mt))
                         app.on_song_end()
                     if len(m) > 3 and m[3] is not None and cfg.get("record_save"):
                         ses.save_record(m[3], m[2], cover=app.window_rect())
+                elif m[0] == "judge":              # 래더·버서스 플레이 화면의 판정 종류 띠
+                    msg = ses.on_judge(m[1], m[2])
+                    if msg:
+                        app.sync_window_setting()
+                        app.set_status(msg=msg)
+                elif m[0] == "lresult":            # 래더: 대기 화면의 라운드 점수
+                    rec = ses.on_ladder_result(m[1], m[2])
+                    if rec is not None:
+                        z = ses.zero
+                        zt = ("  · 영점 보정 추천 %+.1f (%d곡)" % (z["best"], z["n"])) if z and z.get("n", 0) >= 3 else ""
+                        gm = "" if cfg.get("game_mode") in ("래더", "버서스 매치") else \
+                            " — 게임 모드를 [래더]로 바꾸면 래더 곡들로 영점을 추천해요"
+                        app.set_status(msg="래더 %d라운드 점수 읽음: %s점 (%s쪽, 분석기 예상 %s점)%s  · 래더 곡으로 저장%s" % (
+                            rec["round"], format(rec["score"], ","), "왼" if rec.get("side") == "L" else "오른",
+                            format(ses.predicted_score(rec) or 0, ","), zt, gm))
+                        app.on_song_end()
+                    if len(m) > 3 and m[3] is not None and cfg.get("record_save"):
+                        ses.save_record(m[3], m[2], cover=app.window_rect(), ladder=m[1])
                 elif m[0] == "songend":
                     ses.on_songend(m[1])
                     app.on_song_end()

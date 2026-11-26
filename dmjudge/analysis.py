@@ -149,6 +149,46 @@ class Matcher:
         self.center, self.fast_win, self.fs = c, fw, fs
 
 
+# ------------------------------------------------------------ 점수 (게임 판정 단계)
+# 100% 범위 바깥으로 100% 범위의 0.4배(노멀 16.67ms = 1/60초)마다 한 단계씩 90% → 80% … 10% → 1%, 그 밖은 BREAK.
+GRADE_PCT = (100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 1)      # 레벨 0~10, 레벨 11 = BREAK
+GRADE_PTS = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0, 0.0)   # 1%는 10점 미만이라 0점으로 셈
+MAX_SCORE = 1000000
+BREAK_LV = len(GRADE_PCT)
+
+
+def grade_levels(j, win: float) -> np.ndarray:
+    """판정 기준 오차(ms) → 판정 레벨 (0 = 100%, 1 = 90% … 10 = 1%, 11 = BREAK)"""
+    a = np.abs(np.asarray(j, dtype=float))
+    step = float(win) * 0.4
+    lv = np.ceil((a - float(win)) / step)
+    lv = np.where(a <= float(win), 0, lv)
+    return np.minimum(lv, BREAK_LV).astype(int)
+
+
+def judge_score(j, win: float, n_break: int = 0):
+    """만점 1,000,000점을 노트 수로 나눠 노트 하나의 점수, 판정 %만큼 받음 (1%·BREAK = 0점).
+    반환 dict(score 점수, rate 퍼센트, counts 레벨별 개수, n 노트 수) 또는 노트가 없으면 None"""
+    lv = grade_levels(j, win)
+    counts = np.bincount(lv, minlength=BREAK_LV + 1)
+    counts[BREAK_LV] += int(n_break)
+    n = int(counts.sum())
+    if n == 0:
+        return None
+    rate = float((counts * np.array(GRADE_PTS)).sum()) / n
+    return {"score": int(round(MAX_SCORE * rate)), "rate": 100.0 * rate, "counts": counts.tolist(), "n": n}
+
+
+def score_from_counts(counts):
+    """판정 개수 [100%, 90%, 80% … 10%, 1%, BREAK] (12개, 게임 결과 화면과 같은 순서) → judge_score와 같은 dict"""
+    c = np.asarray(list(counts)[:BREAK_LV + 1], dtype=float)
+    if len(c) < BREAK_LV + 1 or c.sum() <= 0:
+        return None
+    n = int(c.sum())
+    rate = float((c * np.array(GRADE_PTS)).sum()) / n
+    return {"score": int(round(MAX_SCORE * rate)), "rate": 100.0 * rate, "counts": [int(x) for x in c], "n": n}
+
+
 def summarize(e: np.ndarray, judge_setting: float, win: float, bias: float = 0.0, fs: float = 0.0,
               rec: bool = True):
     """e: 화면 기준 오차(ms) 배열. 반환: 통계 dict"""
@@ -169,6 +209,7 @@ def summarize(e: np.ndarray, judge_setting: float, win: float, bias: float = 0.0
         "fast": int((j < -fs).sum()),        # FAST/SLOW 기준(±fs ms) 밖
         "slow": int((j > fs).sum()),
         "in_now": float((np.abs(j) <= win).mean()),
+        "rate_now": float(judge_score(j, win)["rate"]),     # 예상 정확도(점수 %): 판정 단계별 점수로
         "early_now": int((j < -win).sum()),
         "late_now": int((j > win).sum()),
     }
@@ -179,14 +220,17 @@ def summarize(e: np.ndarray, judge_setting: float, win: float, bias: float = 0.0
 
 
 def recommend(e: np.ndarray, win: float, bias: float = 0.0, lo=-120, hi=120):
-    """±win 안에 들어오는 노트 수가 최대가 되는 판정 타이밍 값(정수 ms)."""
+    """예상 정확도(점수 %)가 가장 높아지는 판정 타이밍 값(정수 ms)."""
     if len(e) == 0:
         return {}
     ss = np.arange(lo, hi + 1)
     je = e[None, :] + ss[:, None] + bias
-    cnt = (np.abs(je) <= win).sum(1)
-    mx = cnt.max()
-    plateau = ss[cnt == mx]
+    a = np.abs(je)
+    cnt = (a <= win).sum(1)
+    lv = np.where(a <= win, 0, np.minimum(np.ceil((a - win) / (0.4 * win)), BREAK_LV)).astype(int)
+    rate = np.asarray(GRADE_PTS)[lv].mean(1)
+    mx = rate.max()
+    plateau = ss[rate >= mx - 1e-12]
     # 최대 구간이 여러 개면 중앙값 기준점에 가장 가까운 구간의 가운데
     center = -(np.median(e) + bias)
     groups = np.split(plateau, np.where(np.diff(plateau) > 1)[0] + 1)
@@ -196,7 +240,8 @@ def recommend(e: np.ndarray, win: float, bias: float = 0.0, lo=-120, hi=120):
     margin_hi = win - (e + s_best + bias).max()
     return {
         "best_setting": s_best,
-        "in_best": float(mx / len(e)),
+        "in_best": float(cnt[s_best - lo] / len(e)),
+        "rate_best": float(rate[s_best - lo] * 100.0),
         "margin_early": float(margin_lo),
         "margin_late": float(margin_hi),
     }
@@ -290,6 +335,44 @@ OVER_A = 0.5
 OVER_B = 0.2
 
 
+def _score_ll(e, ex, win, ks, sigma, phi):
+    """점수만 아는 곡(래더)의 영점 K별 로그 우도.
+    잃은 점수 D = (1 - 점수/1,000,000) x 노트 수 = 노트마다 (100% - 판정%)의 합 (1%·BREAK는 1).
+    분석기 오차 + K로 노트마다 판정 단계를 정해 잃은 점수의 기댓값·분산을 구한다(단계 경계 근처는 측정 흔들림만큼 나눔).
+    분석기가 못 본 BREAK 개수 b는 모르므로, 지금까지 결과 화면에서 본 BREAK·1% 비율(lam)로 b를 평균낸다."""
+    from math import lgamma, log
+    N = max(float(ex.get("N") or len(e)), float(len(e)))
+    D = (1.0 - float(ex["score"]) / MAX_SCORE) * N
+    lam = max(1e-4, float(ex.get("lam") or 0.003))
+    h = float(len(e))
+    loss = 1.0 - np.array(GRADE_PTS)
+    step = 0.4 * win
+    bs = np.arange(0, 41)
+    lpb = np.array([-lam * N + b * log(lam * N) - lgamma(b + 1) for b in bs])
+    kc = np.arange(ks[0], ks[-1] + 0.25, 0.25)              # 계산은 0.25ms 간격으로 하고 사이는 이어 붙임 (가볍게)
+    ll = np.empty(len(kc))
+    mus = np.empty(len(kc))
+    for i, k in enumerate(kc):
+        a = np.abs(e + k)
+        # 가장 가까운 단계 경계: win + step*j (j = 0..10)
+        j = np.clip(np.round((a - win) / step), 0, 10)
+        edge = win + step * j
+        p_out = 1.0 - phi((edge - a) / sigma)               # 경계 바깥(한 단계 아래)일 확률
+        lo_lv = j.astype(int)                                # 경계 안쪽 단계 = j (0 = 100%)
+        hi_lv = np.minimum(lo_lv + 1, BREAK_LV)
+        L1, L2 = loss[lo_lv], loss[hi_lv]
+        m_ = L1 + p_out * (L2 - L1)
+        v_ = p_out * (1 - p_out) * (L2 - L1) ** 2
+        T, vT = float(m_.sum()), float(v_.sum())
+        mb = T * (N - bs) / h + bs                           # 못 본 BREAK b개: 나머지는 본 노트처럼
+        var = vT + 0.05 + OVER_A * 0.04 + (OVER_B * mb) ** 2
+        q = lpb - 0.5 * (D - mb) ** 2 / var - 0.5 * np.log(var)
+        mx = q.max()
+        ll[i] = mx + np.log(np.exp(q - mx).sum())
+        mus[i] = T * N / h
+    return np.interp(ks, kc, ll), np.interp(ks, kc, mus)
+
+
 def fit_zero(songs, win: float = 125.0 / 3.0, sigma: float = 1.5, lo=-30.0, hi=40.0, step=0.05, brk=1e9):
     """결과 화면 기반 영점 보정 추천.
     songs: [(e0 배열, 게임의 MAX 100% 아닌 개수(BREAK 제외))] — e0 = 화면 기준 오차 + 판정 타이밍 (보정 전).
@@ -298,8 +381,12 @@ def fit_zero(songs, win: float = 125.0 / 3.0, sigma: float = 1.5, lo=-30.0, hi=4
     (brk: 이보다 큰 오차는 BREAK로 볼 때 쓰는 값. 판정 등급이 1/60초씩 넓어져 MAX 1%가 분석기 짝짓기 범위(-190~+150)보다 넓으므로 기본은 끔)  
     반환: dict(best, lo, hi(95%), per=[(게임 개수, K=best일 때 예상 개수)]) 또는 None"""
     from math import erf, sqrt
-    # songs 항목: (e0, 게임 개수) 또는 (e0, 게임 개수, 노트별 게임 글자 -1 FAST / +1 SLOW / 0 못 봄)
+    # songs 항목: (e0, 게임 개수[, 노트별 게임 글자 -1 FAST / +1 SLOW / 0 못 봄[, 그 곡의 100% 범위]])
+    # 영점(기기 지연)은 판정 종류와 상관없으므로, 하드·맥스 곡도 그 곡의 100% 범위로 계산해 같이 쓸 수 있다.
+    # 5번째 값 = 래더처럼 점수만 아는 곡: {"score": 게임 점수, "N": 노트 수, "lam": BREAK·1% 비율} (게임 개수는 None)
     raw = []
+    wins = []
+    extras = []
     for s_ in songs:
         e, n = s_[0], s_[1]
         lab = s_[2] if len(s_) > 2 else None
@@ -307,7 +394,9 @@ def fit_zero(songs, win: float = 125.0 / 3.0, sigma: float = 1.5, lo=-30.0, hi=4
             continue
         e = np.asarray(e, float)
         lab = np.asarray(lab, float) if lab is not None and len(lab) == len(e) else np.zeros(len(e))
-        raw.append((e, int(n), lab))
+        raw.append((e, -1 if n is None else int(n), lab))
+        wins.append(float(s_[3]) if len(s_) > 3 and s_[3] else float(win))
+        extras.append(s_[4] if len(s_) > 4 else None)
     songs = [(e, n) for e, n, _ in raw]
     if not songs:
         return None
@@ -319,8 +408,13 @@ def fit_zero(songs, win: float = 125.0 / 3.0, sigma: float = 1.5, lo=-30.0, hi=4
 
     LL = np.zeros(len(ks))
     curves = []
-    for e, n in songs:
+    for (e, n), win, ex in zip(songs, wins, extras):
         e = e[np.abs(e) < 300]
+        if ex is not None and ex.get("score") is not None:
+            ll_s, mu_s = _score_ll(e, ex, win, ks, sigma, phi)
+            LL += ll_s
+            curves.append(mu_s)
+            continue
         mu = np.empty(len(ks))
         var = np.empty(len(ks))
         # 범위 근처 노트만 계산 (멀리 있는 노트는 확률 0 또는 1)
@@ -354,13 +448,14 @@ def fit_zero(songs, win: float = 125.0 / 3.0, sigma: float = 1.5, lo=-30.0, hi=4
     if len(peaks) > 1:
         E = np.concatenate([e for e, _, _ in raw])
         L = np.concatenate([lab for _, _, lab in raw])
+        Wn = np.concatenate([np.full(len(e), w_) for (e, _, _), w_ in zip(raw, wins)])
         m_ = L != 0
         sc = []
         for pk in peaks:
             d = E[m_] + ks[pk]
             s3 = LAB_SIGMA
-            pf = phi((-win - d) / s3)                     # 게임 오차가 FAST 쪽 범위 밖일 확률
-            ps = 1.0 - phi((win - d) / s3)
+            pf = phi((-Wn[m_] - d) / s3)                  # 게임 오차가 FAST 쪽 범위 밖일 확률
+            ps = 1.0 - phi((Wn[m_] - d) / s3)
             p = np.where(L[m_] < 0, pf, ps)
             sc.append(float(np.log(LAB_NOISE / 2 + (1 - LAB_NOISE) * p).sum()))   # 글자 짝짓기 실수 몫
         order = np.argsort(sc)[::-1]

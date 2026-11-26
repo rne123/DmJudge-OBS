@@ -1150,7 +1150,7 @@ def advise(rep, cfg=None):
 
     # 놓침을 믿어도 되는지: 게임 결과(BREAK)와 비교
     g = rep.get("game")
-    brk = int(g[11]) if g and len(g) > 11 else None
+    brk = int(g[11]) if g and len(g) > 11 else int(g[2]) if g and len(g) == 3 else None
     miss_ok = None if brk is None else (a["miss"] <= max(3, 2 * brk))
     miss_note = "" if miss_ok else " (분석기 놓침에는 노트를 잘못 본 경우가 섞일 수 있어요)"
 
@@ -1760,6 +1760,11 @@ def save_history(h):
         pass
 
 
+def _game_nb(g):
+    """게임 결과 → (100% 아닌 개수, BREAK). 일반 결과 화면 12개 또는 미션 결과 화면 3개"""
+    return (int(g[1]), int(g[2])) if len(g) == 3 else (int(sum(g[1:11])), int(g[11]))
+
+
 def summary(rep, adv, judge="normal", start_t=None):
     T = rep["tags"]
     return {"when": time.strftime("%Y-%m-%d %H:%M"), "ts": time.time(), "mode": rep["mode"], "judge": judge,
@@ -1936,7 +1941,7 @@ def report_text(rep, adv, cfg=None, trend=None, title="이 곡", rev=None, pool=
     mode = rep["mode"]
     L.append(("h", "오답노트 · %s · %s · %d노트 · %s" % (title, mode, rep["n"], mmss(rep["dur"] * 1000))))
     g = rep.get("game")
-    gt = (" · 게임 결과 100%%아님 %d, BREAK %d" % (sum(g[1:11]), g[11])) if g else ""
+    gt = (" · 게임 결과 100%%아님 %d, BREAK %d" % _game_nb(g)) if g else ""
     L.append(("p", "평균 %s ms · 흔들림 ±%.1f ms · 100%% 밖 %.1f%%%s" % (fmt(a["mean"]), a["sd"], a["out"] * 100, gt)))
     gd = rep.get("grid") or {}
     if gd.get("bpms"):

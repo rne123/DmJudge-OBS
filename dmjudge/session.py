@@ -7,7 +7,8 @@ from collections import defaultdict
 
 import numpy as np
 
-from .analysis import Matcher, summarize, histogram, suggest_zero, fit_zero
+from .result_ocr import summary as _rsum
+from .analysis import Matcher, summarize, histogram, suggest_zero, fit_zero, judge_score
 from .config import MODES, mode_channels
 
 LANES_OF = {"4B": 4, "5B": 5, "6B": 6, "8B": 6}
@@ -38,6 +39,11 @@ def split_songs(hits, gap=6000.0):
 class Session:
     def __init__(self, cfg):
         self.cfg = cfg
+        if cfg.get("capture_thread", True) is False:   # 예전 캡처 방식은 없앰: 새 방식으로 바꾸고 그 방식의 영점으로
+            v = (cfg.get("calib_by_capture") or {}).get("thread")
+            if v is not None:
+                cfg["calib_ms"] = cfg["calib_common"] = float(v)
+        cfg["capture_thread"] = True
         if "calib_common" not in cfg:          # 버튼별 영점 따로 쓰기 전의 값 = 공통 영점
             cfg["calib_common"] = float(cfg.get("calib_ms", 0.0))
         self.rebuild()
@@ -262,8 +268,9 @@ class Session:
         self._last_result_t = t
         self.song_end = (g[0], g[1])
         js = float(self.cfg.get("judge_setting_ms", 0))
+        mission = len(vals) == 3          # 미션 결과 화면 (MAX 100% / 1~90% / BREAK만): 미션은 하드 판정, 게임 모드는 미션
         rec = {"when": time.strftime("%m-%d %H:%M"), "mode": m, "game": [int(v) for v in vals],
-               "non100": int(sum(vals[1:11])), "brk": int(vals[11]), "n": len(hits),
+               "non100": int(_rsum(vals)[1]), "brk": int(_rsum(vals)[2]), "n": len(hits),
                "e0": [round(h[3] + js, 2) for h in hits], "js": js,
                "calib": float(self.cfg.get("calib_ms", 0.0)), "use": True,
                "judge": self.judge_kind(), "fs": self.fs_range(),
@@ -271,6 +278,60 @@ class Session:
                "gmode": self.cfg.get("game_mode", "프리스타일"),
                "ch": [str(h[2]) for h in hits],        # 노트별 레인 (키별 차이 확인용)
                # 노트별 게임 글자 (-1 FAST / +1 SLOW / 0 못 봄): 영점 거울 해를 가를 때 방향 정보로 씀
+               "lab": [{"fast": -1, "slow": 1}.get(self.text_links.get((h[2], round(h[0] + h[3], 1))), 0)
+                       for h in hits]}
+        if mission:
+            rec["judge"], rec["win"], rec["gmode"], rec["mission"] = "hard", self.hard_win(), "미션", True
+        self.results.append(rec)
+        if len(self.results) > 120:
+            self.results = self.results[-120:]
+        save_results(self.results)
+        self.update_zero()
+        self.coach_after_song()
+        return rec
+
+    def on_ladder_result(self, info, t):
+        """래더 대기 화면에서 방금 라운드의 내 점수를 읽었을 때: 결과 화면처럼 곡 끝 · 기록 · 영점 추천 목록에 넣는다.
+        단계별 개수가 없어서 영점 추천은 점수(잃은 점수)로 계산한다. 반환: 저장한 기록 또는 None"""
+        L, R = info.get("L"), info.get("R")
+        if getattr(self, "_last_result_t", -1e18) > t - 5000.0:
+            return None
+        m = self.active_mode()
+        g = self._last_song_hits(t)
+        if m is None or g is None or len(g[2]) < 100:
+            self.log("lresult", L if L is not None else -1, R if R is not None else -1, int(info.get("round", 0)), "")
+            return None
+        hits = g[2]
+        self._last_result_t = t
+        self.song_end = (g[0], g[1])
+        js = float(self.cfg.get("judge_setting_ms", 0))
+        lanes = LANES_OF.get(m, 6)
+        n_arr = sum(1 for a_, l_ in self.arr_log if l_ == lanes and g[0] - 500 <= a_ <= g[1] + 500)
+        gm = self.cfg.get("game_mode") or GAME_MODES[0]
+        sj = getattr(self, "screen_judge", None)
+        if sj and sj[0] in ("hard", "max", "normal") and sj[1] >= g[0] - 30000.0:
+            jk = sj[0]
+            jw = {"hard": self.hard_win(), "max": self.max_win(), "normal": 125.0 / 3.0}[jk]
+        else:
+            jk, jw = self.judge_kind(), float(self.cfg.get("window_ms", 125.0 / 3.0))
+        # 내 점수가 왼쪽인지 오른쪽인지는 판마다 다름 → 분석기 예상 점수에 더 가까운 쪽
+        cands = [(s_, sd) for s_, sd in ((L, "L"), (R, "R")) if s_ is not None]
+        if not cands:
+            return None
+        pred = judge_score(np.array([h[3] + js for h in hits]) + float(self.cfg.get("calib_ms", 0.0)), jw)
+        pv = pred["score"] if pred else 1000000
+        score, side = min(cands, key=lambda c: abs(c[0] - pv))
+        self.log("lresult", score, int(info.get("round", 0)), side)
+        rec = {"when": time.strftime("%m-%d %H:%M"), "mode": m, "game": None, "score": score,
+               "N": int(max(n_arr, len(hits))), "round": int(info.get("round", 0)), "side": side,
+               "opp": (R if side == "L" else L),
+               "non100": None, "brk": None, "n": len(hits),
+               "e0": [round(h[3] + js, 2) for h in hits], "js": js,
+               "calib": float(self.cfg.get("calib_ms", 0.0)), "use": True,
+               # 래더·버서스는 티어에 따라 노멀/하드: 플레이 화면의 HARD JUDGEMENT 띠를 봤으면 하드, 아니면 설정값
+               "judge": jk, "fs": self.fs_range(), "win": jw,
+               "gmode": gm if gm in ("래더", "버서스 매치") else "래더", "ladder": True,
+               "ch": [str(h[2]) for h in hits],
                "lab": [{"fast": -1, "slow": 1}.get(self.text_links.get((h[2], round(h[0] + h[3], 1))), 0)
                        for h in hits]}
         self.results.append(rec)
@@ -281,7 +342,38 @@ class Session:
         self.coach_after_song()
         return rec
 
-    def save_record(self, frame, t, cover=None):
+    def on_judge(self, kind, t):
+        """래더·버서스 플레이 화면의 판정 종류 띠를 봤을 때. 'hard'면 100% 범위(게임이 정하는 범위)를 하드로 맞춘다.
+        반환: 상태 줄에 띄울 글 또는 None"""
+        self.log("judge", kind)
+        self.screen_judge = (kind, t)
+        win = float(self.cfg.get("window_ms", 125.0 / 3.0))
+        for k_, w_, nm in (("hard", self.hard_win(), "HARD JUDGEMENT → 100%% 범위를 하드"),
+                           ("max", self.max_win(), "MAX JUDGEMENT → 100%% 범위를 맥스"),
+                           ("normal", 125.0 / 3.0, "판정 띠 없음(노멀) → 100%% 범위를 노멀")):
+            if kind == k_ and abs(win - w_) > 0.01:
+                self.cfg["window_ms"] = round(w_, 2)
+                return ("플레이 화면에 " + nm + "(±%.2f)로 바꿨어요 (%s)") % (w_, self.cfg.get("game_mode") or GAME_MODES[0])
+        return None
+
+    def break_rate(self):
+        """결과 화면에서 본 BREAK·MAX 1% 비율 (노트당). 래더 점수로 영점을 구할 때 분석기가 못 보는 BREAK 몫"""
+        b = n = 0
+        for r in self.results:
+            g = r.get("game")
+            if g and len(g) >= 12:
+                b += int(g[10]) + int(g[11])
+                n += int(sum(g))
+        return (b / n) if n >= 3000 else 0.003
+
+    def predicted_score(self, rec, calib=None):
+        """이 곡 기록에서 영점 보정 calib일 때 분석기 예상 점수 (래더 곡 비교용)"""
+        cb = float(self.cfg.get("calib_ms", 0.0)) if calib is None else calib
+        W = 125.0 / 3.0 if rec.get("judge", "normal") == "normal" else float(rec.get("win", rec.get("fs", 125.0 / 3.0)))
+        s = judge_score(np.array(rec["e0"]) + cb, W)
+        return s["score"] if s else None
+
+    def save_record(self, frame, t, cover=None, ladder=None):
         """[기록 저장]: 결과 화면이 확정된 곡의 화면과 기록을 별도 스레드에서 파일로 저장 (곡 이름은 OCR로)
         cover: 분석기 창의 화면 위치 (x, y, w, h) — 결과 화면 제목 위에 겹치면 그 부분은 빼고 읽는다"""
         import json
@@ -298,7 +390,7 @@ class Session:
 
         def work():
             try:
-                base, info = record.save_song(frame, rows, cfg, button, cover=cover)
+                base, info = record.save_song(frame, rows, cfg, button, cover=cover, ladder=ladder)
                 import os
                 nm = os.path.basename(base)
                 if info.get("texts") is None:
@@ -384,6 +476,16 @@ class Session:
         self.update_zero()
         return rec
 
+    def max_win(self):
+        """맥스 판정 100% 범위 (노멀의 1/4 = ±10.42)"""
+        p = self.cfg.get("fs_presets") or {}
+        return float(p.get("max", round(125.0 / 3.0 / 4, 2)))
+
+    def hard_win(self):
+        """하드 판정 100% 범위 (노멀의 1/2 = ±20.83, config.json fs_presets.hard로 바꿀 수 있음)"""
+        p = self.cfg.get("fs_presets") or {}
+        return float(p.get("hard", round(125.0 / 3.0 / 2, 2)))
+
     def judge_kind(self):
         """지금 게임 판정 종류: 100% 범위 값으로 판단 (normal / hard / max / custom)"""
         p = self.cfg.get("fs_presets") or {}
@@ -416,7 +518,7 @@ class Session:
         g = self.cfg.get("game_mode") or GAME_MODES[0]
         return "%s · %s" % (g, ("%s 전용" % m) if self.calib_split_on(m) else "공통")
 
-    PRESET_KEYS = ("judge_setting_ms", "output_setting_ms", "calib_common")
+    PRESET_KEYS = ("judge_setting_ms", "output_setting_ms", "calib_common", "window_ms", "fs_ms")  # fs_ms는 사용자가 정한 값을 모드마다 기억만 함
 
     def switch_gmode(self, new):
         """게임 모드(프리스타일·래더 …)는 프리셋: 판정 타이밍·출력 타이밍·영점(공통 + 버튼 전용)을 모드마다 따로 기억.
@@ -433,10 +535,11 @@ class Session:
                 if p.get(k) is not None:
                     cfg[k] = p[k]
             cfg["calib_btn"] = dict(p.get("calib_btn") or {})
+        elif new == "미션":                    # 미션은 기본이 하드 판정: 처음 고를 때 100% 범위(게임이 정하는 범위)만 하드로
+            cfg["window_ms"] = self.hard_win()   # (FAST/SLOW 범위는 사용자가 정하는 값이라 그대로)
         m = self.active_mode() or cfg.get("mode")
         cfg["calib_ms"] = round(self.calib_for(m), 1)
-        cap = "thread" if cfg.get("capture_thread", True) else "old"
-        cfg.setdefault("calib_by_capture", {})[cap] = cfg["calib_ms"]
+        cfg.setdefault("calib_by_capture", {})["thread"] = cfg["calib_ms"]
         self.update_zero()
         return old
 
@@ -449,8 +552,7 @@ class Session:
         else:
             self.cfg["calib_common"] = v
         self.cfg["calib_ms"] = v
-        cap = "thread" if self.cfg.get("capture_thread", True) else "old"
-        self.cfg.setdefault("calib_by_capture", {})[cap] = v
+        self.cfg.setdefault("calib_by_capture", {})["thread"] = v
 
     def sync_calib(self):
         """지금 버튼 모드에 맞는 영점으로 맞춤 (모드가 바뀌었을 때). 바꿨으면 True"""
@@ -470,14 +572,15 @@ class Session:
         return self.zero
 
     def update_zero(self):
-        # 영점 보정은 노멀 판정 곡만으로 (하드·맥스는 판정 범위 자체가 달라서 섞으면 안 됨)
+        # 영점(기기 지연)은 판정 종류와 상관없으니 노멀·하드·맥스 곡을 같이 쓰되, 곡마다 그 곡의 100% 범위로 계산
+        # (사용자 설정 범위로 친 곡은 게임 범위를 몰라서 뺌)
         # 게임 모드도 프리셋이라, 지금 게임 모드에서 친 곡만 (래더·버서스는 결과 화면이 없어 보통 비어 있음)
         g = self.cfg.get("game_mode") or GAME_MODES[0]
-        normal = [r for r in self.results if r.get("use", True) and r.get("judge", "normal") == "normal"
+        normal = [r for r in self.results if r.get("use", True) and r.get("judge", "normal") in ("normal", "hard", "max")
                   and (r.get("gmode") or GAME_MODES[0]) == g]
         # 공통 영점: '따로 쓰기'를 켠 버튼의 곡은 뺌
         use = [r for r in normal if not self.calib_split_on(r.get("mode"))][-30:]
-        self.zero = fit_zero([(np.array(r["e0"]), r["non100"], r.get("lab")) for r in use]) if use else None
+        self.zero = fit_zero([self._zero_item(r) for r in use]) if use else None
         if self.zero is not None:
             self.zero["n"] = len(use)
         # 버튼별 (따로 쓰기 여부와 상관없이 비교용으로 늘 계산)
@@ -486,10 +589,18 @@ class Session:
             rs = [r for r in normal if r.get("mode") == m][-30:]
             if not rs:
                 continue
-            z = fit_zero([(np.array(r["e0"]), r["non100"], r.get("lab")) for r in rs])
+            z = fit_zero([self._zero_item(r) for r in rs])
             if z is not None:
                 z["n"] = len(rs)
                 self.zero_btn[m] = z
+
+    def _zero_item(self, r):
+        """영점 추천에 넣을 곡 하나: (e0, 게임 100% 아닌 개수, 게임 글자, 그 곡의 100% 범위[, 래더 점수])"""
+        w = 125.0 / 3.0 if r.get("judge", "normal") == "normal" else float(r.get("win", r.get("fs", 125.0 / 3.0)))
+        if r.get("score") is not None and r.get("non100") is None:
+            return (np.array(r["e0"]), None, r.get("lab"), w,
+                    {"score": r["score"], "N": r.get("N"), "lam": self.break_rate()})
+        return (np.array(r["e0"]), r["non100"], r.get("lab"), w)
 
     def predicted_out(self, rec, calib=None):
         """이 곡 기록에서 영점 보정 calib일 때 분석기의 범위 밖 개수"""
@@ -531,7 +642,7 @@ class Session:
 
     def song_fs(self):
         """요약 칸용 '이번 곡' FAST/SLOW 개수: 마지막 곡(6초 넘게 끊긴 곳에서 나눔)의 확실한 기록만.
-        다음 곡을 치기 시작하면 새 곡으로 넘어가 0부터 다시 센다. 반환 (FAST, SLOW, 노트 수) 또는 None"""
+        다음 곡을 치기 시작하면 새 곡으로 넘어가 0부터 다시 센다. 반환 (FAST, SLOW, 노트 수, 예상 점수 dict) 또는 None"""
         # 인디케이터와 같은 스레드에서 0.5초마다 불리므로 가볍게: 전체 기록이 아니라 끝부분만 보고,
         # 새 기록이 없으면(결과·선곡 화면) 지난 값을 그대로 쓴다
         m = self.active_mode()
@@ -552,7 +663,8 @@ class Session:
             e = np.array([h[3] for h in g[-1] if h[4] >= 1.0], dtype=float)
             if len(e):
                 j = e + js + cb
-                val = (int((j < -fs).sum()), int((j > fs).sum()), len(j))
+                sc = judge_score(j, float(self.cfg.get("window_ms", 125.0 / 3.0)))
+                val = (int((j < -fs).sum()), int((j > fs).sum()), len(j), sc)
         self._song_fs_key, self._song_fs_val = key, val
         return val
 
@@ -899,9 +1011,53 @@ class Session:
         return out
 
     # ------------------------------------------------------------ 통계
+    PLAY_GAP_MS = 3000.0
+
+    def playing(self):
+        """곡을 치는 중인지: 마지막 노트 도달이 3초 안이면 치는 중 (그동안은 통계·추천·그래프 계산을 쉼)"""
+        if not self.arr_log:
+            return False
+        return time.perf_counter() * 1000.0 - self.arr_log[-1][0] < self.PLAY_GAP_MS
+
     def stats(self):
+        """0.5초마다 불림: 기록·설정이 그대로면 지난 계산을 그대로 씀 (메인 스레드 부하 줄이기)"""
         cfg = self.cfg
         hits = [h for h in self.all_hits() if h[4] >= 1.0]
+        key = (len(hits), hits[-1][0] if hits else None, hits[-1][3] if hits else None,
+               cfg.get("judge_setting_ms"), cfg.get("output_setting_ms"), cfg.get("window_ms"), cfg.get("calib_ms"),
+               self.fs_range(), cfg.get("recent"), cfg.get("measure"), self.active_mode(), len(self.missed()),
+               sum(self.missed().values()))
+        play = self.playing()
+        key = key + (play,)
+        if getattr(self, "_stats_key", None) == key:
+            return self._stats_val
+        self._stats_key = key
+        # 치는 중에는 무거운 추천 계산(판정 타이밍을 1ms씩 다 바꿔 보는 것)만 쉬고, 곡이 끝나면 다시 계산
+        out = self._stats(hits, rec=not play)
+        o = out["overall"]
+        if play and o.get("n"):
+            last = getattr(self, "_rec_last", None) or {}
+            for k_, v_ in (("best_setting", int(cfg.get("judge_setting_ms", 0))), ("in_best", o.get("in_now", 0.0)),
+                           ("rate_best", o.get("rate_now", 0.0)), ("margin_early", 0.0), ("margin_late", 0.0)):
+                o[k_] = last.get(k_, v_)
+            o["rec_stale"] = True
+        elif o.get("n"):
+            self._rec_last = {k_: o[k_] for k_ in ("best_setting", "in_best", "rate_best", "margin_early", "margin_late")
+                              if k_ in o}
+        # 이 곡(마지막 곡)만의 추천: 곡이 끝난 뒤에만 계산 (치는 중에는 None)
+        out["song"] = None
+        if not play:
+            g = self._last_song_hits()
+            if g is not None and len(g[2]) >= 50:
+                sh = self._ear_adjust(list(g[2]))
+                e_ = np.array([h[3] for h in sh], dtype=float)
+                out["song"] = summarize(e_, float(cfg.get("judge_setting_ms", 0)), float(cfg.get("window_ms", 42)),
+                                        float(cfg.get("calib_ms", 0.0)), self.fs_range())
+        self._stats_val = out
+        return self._stats_val
+
+    def _stats(self, hits, rec=True):
+        cfg = self.cfg
         N = int(cfg.get("recent", 0) or 0)
         if N > 0:
             hits = hits[-N:]
@@ -911,7 +1067,7 @@ class Session:
         b = float(cfg.get("calib_ms", 0.0))
         fs = self.fs_range()
         e = np.array([h[3] for h in hits], dtype=float)
-        out = {"overall": summarize(e, js, win, b, fs), "groups": [], "channels": [],
+        out = {"overall": summarize(e, js, win, b, fs, rec=rec), "groups": [], "channels": [],
                "hist": histogram(e + js + b) if len(e) else None, "mode": self.active_mode()}
         # 그룹별/채널별
         by_g, by_c = defaultdict(list), defaultdict(list)
@@ -1047,6 +1203,7 @@ def replay_raw(path):
     real = time.perf_counter
     songs = []
     res_rows = []
+    lres_rows = []
     try:
         time.perf_counter = lambda: clock[0] / 1000.0
         ses = Session.__new__(Session)
@@ -1111,6 +1268,9 @@ def replay_raw(path):
                     pass
             elif k == "result":
                 res_rows.append((t, [int(x) for x in r[2:14]]))
+            elif k == "lresult":
+                if int(r[2]) > 0 and (len(r) < 5 or r[4] != ""):     # 내 점수를 고른 기록만 (예전 형식: 점수, 라운드)
+                    lres_rows.append((t, int(r[2])))
             n += 1
             if n % 50 == 0:
                 ses.tick()
@@ -1122,5 +1282,10 @@ def replay_raw(path):
         cand = [sg for sg in songs if sg["end"] <= t and t - sg["end"] < 120000.0 and sg["result"] is None]
         if cand:
             max(cand, key=lambda sg: sg["end"])["result"] = vals
+    for t, sc in lres_rows:                  # 래더: 점수만
+        cand = [sg for sg in songs if sg["end"] <= t and t - sg["end"] < 120000.0 and sg["result"] is None
+                and sg.get("lscore") is None]
+        if cand:
+            max(cand, key=lambda sg: sg["end"])["lscore"] = sc
     songs.sort(key=lambda sg: sg["start"])
     return cfg, songs
