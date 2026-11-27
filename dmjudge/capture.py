@@ -189,24 +189,24 @@ class FrameDump:
         self.buf.append((t, frame[self.top:self.bot, ::3].copy()))
         while self.buf and t - self.buf[0][0] > self.keep:
             self.buf.popleft()
-        if self.pending and t > self.pending[0] + 300.0:
-            tr = self.pending.pop(0)
-            sel = [(tt, f) for tt, f in self.buf if tr - 900.0 <= tt <= tr + 300.0]
+        if self.pending and t > self.pending[0][0] + self.pending[0][2]:
+            tr, pre, post, tag = self.pending.pop(0)
+            sel = [(tt, f) for tt, f in self.buf if tr - pre <= tt <= tr + post]
             if sel and self.left > 0:
                 self.left -= 1
-                self._save(tr, sel)
+                self._save(tr, sel, tag)
 
-    def request(self, t):
+    def request(self, t, pre=900.0, post=300.0, tag=""):
         if self.left > 0 and t - self.last_req > 1500.0:
             self.last_req = t
-            self.pending.append(t)
+            self.pending.append((t, pre, post, tag))
 
-    def _save(self, tr, sel):
+    def _save(self, tr, sel, tag=""):
         import os
         import threading
         import numpy as np
         os.makedirs(self.out_dir, exist_ok=True)
-        path = os.path.join(self.out_dir, "dump_%d.npz" % int(tr))
+        path = os.path.join(self.out_dir, "dump_%d%s.npz" % (int(tr), ("_" + tag) if tag else ""))
         ts = np.array([x[0] for x in sel])
         fr = np.stack([x[1] for x in sel])
         g = self.geom
@@ -246,7 +246,8 @@ def _run(q, stop_evt, cfg, cmd_q=None):
         try:
             from .config import app_dir
             import os
-            dumper = FrameDump(geom, os.path.join(app_dir(), "dumps"))
+            dumper = FrameDump(geom, os.path.join(app_dir(), "dumps"),
+                               max_files=40 if cfg.get("diag_8b") else 15)
         except Exception:
             dumper = None
     q.put(("info", "캡처 시작: 영역 %s" % (region,)))
@@ -299,7 +300,12 @@ def _run(q, stop_evt, cfg, cmd_q=None):
             while True:
                 cmd = cmd_q.get_nowait()
                 if cmd[0] == "dump" and dumper is not None:
-                    dumper.request(cmd[1])
+                    if len(cmd) > 2:          # 8B 진단: 그 순간 앞 0.35초 ~ 뒤 0.08초만 (파일 크기 줄임)
+                        dumper.request(cmd[1], 350.0, 80.0, cmd[2])
+                    else:
+                        dumper.request(cmd[1])
+                elif cmd[0] == "dumpmax" and dumper is not None:
+                    dumper.left = max(dumper.left, int(cmd[1]))
                 elif cmd[0] == "recsave":
                     rec["on"] = bool(cmd[1])
         except Exception:

@@ -35,6 +35,9 @@ class Matcher:
         self._last_up = {}
         self._down = {}
         self._any_press = deque(maxlen=64)  # 레인 상관없이 최근 누른 시각 (아무것도 안 누른 구간의 '놓침'은 세지 않음)
+        self._held = {}                     # ch -> 지금 누르고 있는 키를 누른 시각
+        self._holds = defaultdict(lambda: deque(maxlen=16))   # ch -> 최근 (누름, 뗌)
+        self.body_drop = 0                  # 누르고 있는 롱노트 몸통을 새 노트로 잘못 잡은 것 (버림)
 
     def on_key(self, key_id, is_down, t, ch):
         if is_down:
@@ -46,14 +49,45 @@ class Matcher:
             if ch_ is not None:
                 self.presses[ch_].append([t, False, chat])
                 self._any_press.append(t)
+                self._held[ch_] = t
         else:
             self._last_up[key_id] = t
+            if ch is not None:
+                d = self._held.pop(ch, None)
+                if d is not None:
+                    self._holds[ch].append((d, t))
+
+    def held_since(self, ch, t, pre):
+        """ch 키를 t - pre 이전부터 t까지 계속 누르고 있었는지"""
+        d = self._held.get(ch)
+        if d is not None and d <= t - pre:
+            return True
+        return any(a <= t - pre and b >= t for a, b in self._holds.get(ch, ()))
+
+    # 8B: 사이드(TL/TR) 롱노트의 주황 몸통은 그쪽 절반 레인을 덮는다. 몸통 아래에서 생기는 가짜 노트 판별용
+    COVER = {"L1": "TL", "L2": "TL", "L3": "TL", "L4": "TR", "L5": "TR", "L6": "TR"}
+    HOLD_PRE = 120.0
 
     PHANTOM_MS = 25.0      # 같은 레인에 이보다 가깝게 붙은 도달은 노트가 아님 (실제 채보 최소 간격은 40ms 이상)
     PHANTOM_SPAN = 300.0
 
     def on_arrival(self, ch, t, conf, is_long, nid=None):
         arr = self.arrivals[ch]
+        # 같은 레인 키를 이 노트 도달 전부터 계속 누르고 있으면, 이 '노트'는 그 키로 누르고 있는 롱노트의 몸통을
+        # 새 노트로 잘못 잡은 것 (새 노트는 키를 다시 눌러야만 칠 수 있으므로 진짜 노트일 수 없음).
+        # 8B 사이드 롱노트에서 0.15초마다 가짜 노트가 생겨 '놓침'이 늘고 다른 입력을 가로채던 문제
+        if conf > 0 and self.held_since(ch, t, self.HOLD_PRE):
+            self.body_drop += 1
+            arr.append([t, -1.0, is_long, False, nid, False])
+            return
+        cv = self.COVER.get(ch)
+        under = cv is not None and self.held_since(cv, t, self.HOLD_PRE)
+        # 롱노트끼리 25ms 안에 겹친 것: 롱노트 머리를 두 번 잡은 것 → 뒤의 것만 버림
+        # (전환 화면 번쩍임으로 보고 앞뒤 0.3초 모든 레인을 지우면, 8B 전 레인 롱노트 동치가 통째로 사라짐)
+        if any(abs(a[0] - t) < self.PHANTOM_MS and a[1] >= 0 and (is_long or a[2]) for a in arr[-6:]) \
+                and not any(abs(pt - t) < self.PHANTOM_SPAN for pt in self._ph_t[-8:]):
+            arr.append([t, -1.0, is_long, False, nid, under])
+            return
         # 곡 시작·전환 화면의 번쩍임/와이프는 같은 레인에 몇 ms 간격으로 '도달'을 줄줄이 만든다
         # → 서로 붙어 있는 것끼리 전부 가짜로 표시 (짝짓기·놓침 집계에서 빠짐).
         # 그런 묶음이 나온 앞뒤 PHANTOM_SPAN ms 안의 다른 레인 도달도 같은 화면 효과로 보고 뺀다.
@@ -72,7 +106,7 @@ class Matcher:
                         self.phantom += 1
             self.phantom += 1
             conf = -1.0
-        arr.append([t, conf, is_long, False, nid])   # [3] = SLOW 조기 확정 여부, [4] = 노트 번호
+        arr.append([t, conf, is_long, False, nid, under])   # [3] = SLOW 조기 확정 여부, [4] = 노트 번호, [5] = 사이드 롱노트 몸통 아래
 
     def resolve(self, now):
         """now 시각까지 확정할 수 있는 노트를 확정한다.
@@ -108,6 +142,10 @@ class Matcher:
                         best, bd = p, d
                 if best is not None:
                     dd = best[0] - tc
+                    # 사이드 롱노트 몸통 아래 노트가 범위 밖으로 짝지어지면: 몸통 그림을 노트로 잘못 잡아 다른 입력을
+                    # 가져온 경우가 대부분(8B 실측 12개 중 11개) → FAST/SLOW 표시·통계에서 뺀다
+                    if len(a) > 5 and a[5] and abs(dd) > fs:
+                        conf = min(conf, 0.3)
                     sure = True                  # 먼저 누른 입력이 정해졌으면 더 기다릴 것 없음
                     if sure or now >= tc + W:
                         best[1] = True
@@ -125,7 +163,7 @@ class Matcher:
                 if now >= tc + W:
                     self.provisional.pop(id(a), None)
                     # 앞뒤로 키를 하나도 안 누르던 구간(곡 시작 전 화면, 데모 재생 등)은 놓침으로 안 셈
-                    if conf >= 1.0 and any(abs(p - ta) < 1500.0 for p in self._any_press):
+                    if conf >= 1.0 and not (len(a) > 5 and a[5]) and any(abs(p - ta) < 1500.0 for p in self._any_press):
                         self.missed[ch] += 1
                     done = i + 1
                     continue

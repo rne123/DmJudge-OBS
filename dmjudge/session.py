@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import csv
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import numpy as np
 
@@ -90,6 +90,7 @@ class Session:
         self.past_missed = defaultdict(int)
         self.seg_start = 0.0
         self.seg_trigger = False
+        self.seg_trig_n = 0
         self.lanes_guess = None
         self.vchg = []             # 변속 감지 [(t, lanes, 이전 속도, 새 속도)]
         self._suspect = set()      # 즉시값과 확정값이 크게 달라 믿지 않는 노트 id
@@ -108,6 +109,10 @@ class Session:
         self._last_kid = {}        # (모드, 채널) → 마지막으로 누른 키 (5B 가운데 레인이 어느 손인지)
         self._inst_rel = {}        # nid → 누르는 순간 예상이 '믿을 만한' 것이었는지
         self.dump_requests = []    # 화면 저장 요청 (도달 시각) → 캡처 프로세스로
+        self._diag_pend = []       # 8B 진단: [(확인할 시각, 종류, 채널, 시각)]
+        self._diag_last = -1e18
+        self._diag_prs = defaultdict(lambda: deque(maxlen=12))    # 채널 → 최근 누른 시각
+        self._diag_side = defaultdict(lambda: deque(maxlen=12))   # TL/TR → 최근 도달 시각
         self._hit_idx = {}
         self._long_nids = set()
         self.last_instant_t = None
@@ -166,6 +171,7 @@ class Session:
             mt.on_key(kid, is_down, t, self.key_to_ch[m].get(kid))
         if is_down:
             self._instant(kid, t)
+            self._diag_key(kid, t)
         else:
             m = self.active_mode()
             ch = self.key_to_ch[m].get(kid) if m else None
@@ -356,6 +362,52 @@ class Session:
                 return ("플레이 화면에 " + nm + "(±%.2f)로 바꿨어요 (%s)") % (w_, self.cfg.get("game_mode") or GAME_MODES[0])
         return None
 
+    def key_hint(self):
+        """방금 곡에서 어떤 레인 노트에 그 레인 키가 거의 안 눌리고 다른 키가 꾸준히 눌렸으면 키 설정 안내 글.
+        (예: 8B 오른쪽 트리거를 → 로 설정했는데 실제로는 Num0을 누름 → 그 레인 노트가 전부 놓침으로 잡힘)"""
+        m = self.active_mode()
+        g = self._last_song_hits()
+        if m is None or g is None:
+            return None
+        t0, t1 = g[0] - 1000.0, g[1] + 1000.0
+        km = self.cfg["modes"][m]["keymap"]
+        lanes = LANES_OF.get(m, 6)
+        arr, downs = {}, []
+        for r in self.raw[-200000:]:
+            if r[1] == "arr" and r[2] == lanes and t0 <= r[4] <= t1 and r[5] >= 1.0:
+                arr.setdefault(r[3], []).append(r[4])
+            elif r[1] == "key" and r[3] == 1 and t0 <= r[4] <= t1:
+                downs.append((r[4], r[2]))
+        if not downs:
+            return None
+        downs.sort()
+        dt = np.array([d[0] for d in downs])
+        out = []
+        for ch, ts in arr.items():
+            if ch not in km or len(ts) < 10:
+                continue
+            own = set(km[ch])
+            hit_own, other = 0, {}
+            for ta in ts:
+                i0, i1 = np.searchsorted(dt, ta - 100.0), np.searchsorted(dt, ta + 100.0)
+                near = {downs[i][1] for i in range(i0, i1)}
+                if near & own:
+                    hit_own += 1
+                for kid in near - own:
+                    other[kid] = other.get(kid, 0) + 1
+            if hit_own >= 0.4 * len(ts) or not other:
+                continue
+            kid, c = max(other.items(), key=lambda kv: kv[1])
+            if c >= 0.6 * len(ts):
+                from .keys_win import key_name
+                nm = {"TL": "트리거 왼쪽", "TR": "트리거 오른쪽", "SL": "사이드 왼쪽", "SR": "사이드 오른쪽"}.get(
+                    ch, "레인 " + ch[1:] if ch.startswith("L") else ch)
+                out.append("%s %s 노트 %d개 중 %d개에 %s 키를 눌렀어요(설정은 %s)" % (
+                    m, nm, len(ts), c, key_name(kid), "/".join(key_name(k) for k in km[ch])))
+        if not out:
+            return None
+        return "키 설정 확인: " + " · ".join(out) + " — [설정] 탭 [키 설정]에서 바꿔 주세요"
+
     def break_rate(self):
         """결과 화면에서 본 BREAK·MAX 1% 비율 (노트당). 래더 점수로 영점을 구할 때 분석기가 못 보는 BREAK 몫"""
         b = n = 0
@@ -408,12 +460,9 @@ class Session:
         return True
 
     def on_songend(self, t):
-        """기어의 판정선이 사라짐 = 곡 끝 (그래프가 끝난 곡 전체를 보여주도록)"""
+        """기어의 판정선이 사라짐: 기록만 남긴다. 곡 끝 처리(그래프 전환·오답노트)는 결과 화면을 읽었을 때만 한다.
+        (8B 사이드 롱노트가 기어를 덮는 곳 등에서 곡 중간에 판정선이 안 보여 '곡 끝'으로 잡히던 문제)"""
         self.log("songend", round(t, 2))
-        g = self._last_song_hits()
-        if g is not None and len(g[2]) >= 100:
-            self.song_end = (g[0], g[1])
-            self.coach_after_song()
 
     # ------------------------------------------------------------ 코치 (곡이 끝난 뒤에만, 별도 스레드로)
     def coach_after_song(self):
@@ -801,8 +850,69 @@ class Session:
         for m, mt in self.matchers.items():
             if LANES_OF[m] == lanes and ch in mode_channels(m):
                 mt.on_arrival(ch, t, conf, is_long, nid)
-        if lanes == 6 and ch in ("TL", "TR") and conf >= 1:
-            self.seg_trigger = True
+        if conf >= 1.0:
+            self._diag_arrival(ch, t)
+        if lanes == 6 and ch in ("TL", "TR") and conf >= 1 and self.lanes_guess in (None, 6):
+            # 8B 판별: 트리거 노트가 3개 넘게 보여야 8B (한두 개는 다른 모드의 그림을 잘못 잡은 것일 수 있음)
+            self.seg_trig_n = getattr(self, "seg_trig_n", 0) + 1
+            if self.seg_trig_n >= 3:
+                self.seg_trigger = True
+
+    # ------------------------------------------------------------ 8B 진단 저장 ([설정] 탭, 기본 꺼짐)
+    # 사이드(주황) 노트 때문에 가짜 노트가 생기거나 사이드 노트를 놓친 것으로 보이는 순간의 기어 화면을 PC에 저장
+    # (앱 폴더 dumps/ 안 dump_<시각>_fake.npz / _sidemiss.npz). 인터넷으로 보내지 않음.
+    DIAG_COVER = {"L1": "TL", "L2": "TL", "L3": "TL", "L4": "TR", "L5": "TR", "L6": "TR"}
+
+    def _diag_on(self):
+        return bool(self.cfg.get("diag_8b")) and self.active_mode() == "8B" and "8B" in self.matchers
+
+    def _diag_arrival(self, ch, t):
+        if not self._diag_on():
+            return
+        if ch in ("TL", "TR"):
+            self._diag_side[ch].append(t)
+        cv = self.DIAG_COVER.get(ch)
+        if cv is None:
+            return
+        mt = self.matchers["8B"]
+        side = mt._held.get(cv) is not None or any(abs(p - t) < 150.0 for p in self._diag_prs[cv])
+        if side:
+            self._diag_pend.append((t + 250.0, "fake", ch, t))
+
+    def _diag_key(self, kid, t):
+        if not self._diag_on():
+            return
+        ch = self.key_to_ch["8B"].get(kid)
+        if ch is None:
+            return
+        self._diag_prs[ch].append(t)
+        if ch in ("TL", "TR") and self._last_arr is not None and t - self._last_arr < 2000.0:
+            self._diag_pend.append((t + 350.0, "sidemiss", ch, t))
+
+    def _diag_check(self, now):
+        if not self._diag_pend:
+            return
+        keep = []
+        mt = self.matchers.get("8B")
+        for item in self._diag_pend:
+            at, kind, ch, t = item
+            if now < at:
+                keep.append(item)
+                continue
+            if mt is None or now - at > 1500.0:
+                continue
+            bad = False
+            if kind == "fake":      # 그 레인 키는 안 눌렀는데 노트가 생김
+                bad = not any(abs(p - t) < 150.0 for p in self._diag_prs[ch])
+            else:                    # 사이드 키를 눌렀는데 사이드 노트가 안 잡힘
+                c = mt.center
+                bad = not any(abs(a + c - t) < 150.0 for a in self._diag_side[ch])
+            if bad and now - self._diag_last > 1500.0:
+                self._diag_last = now
+                ta = t if kind == "fake" else t - mt.center
+                self.log("diag", kind, ch, round(ta, 2))
+                self.dump_requests.append((ta, kind))
+        self._diag_pend = keep
 
     def on_lanes(self, n):
         self.log("lanes", n)
@@ -844,6 +954,7 @@ class Session:
         self.matchers = {mm: self._new_matcher() for mm in self.candidates}
         self.seg_start = t
         self.seg_trigger = False
+        self.seg_trig_n = 0
         self.lanes_guess = None
         self._ev_idx = {}
         self._hit_idx = {}
@@ -898,10 +1009,23 @@ class Session:
                     self._suspect.add(nid)
                     self.log("suspect", h[1], nid, round(iv[3] - c, 1), round(h[2] - c, 1), round(h[0], 2))
             i0 = self._ev_idx.get(m, 0)
+            press_of = {h[4]: h[0] + h[2] for h in mt.hits[self._hit_idx.get(m, 0):] if len(h) > 4}
             for ev in mt.events[i0:]:
                 nid = ev[4] if len(ev) > 4 else None
                 if nid is not None and (nid in self._flashed or nid in self._suspect):
                     continue
+                # 확정 때 처음 뜨는 FAST/SLOW 글자는, 누르는 순간 같은 키 입력이 이 노트에 짝지어졌고 값도 비슷할 때만.
+                # 누를 때는 다른 노트(또는 아무 노트도 아님)였는데 나중에 이 노트로 짝지어진 것 = 짝을 잘못 지은 경우가 대부분
+                # (8B 실측: 이런 글자 10개 중 게임도 FAST/SLOW였던 건 2개, 'SLOW 127ms'처럼 크게 튀는 헛글자의 원인)
+                if nid is not None:
+                    iv = self.instant.get(nid)
+                    pt = press_of.get(nid)
+                    if (iv is None or iv[1] != m or pt is None or abs(iv[5] - pt) >= 3.0
+                            or abs((iv[3] - c) - ev[3]) > 15.0):
+                        self._flashed.add(nid)
+                        self.log("noflash", ev[0], ev[1], nid, round(ev[3], 1),
+                                 None if iv is None else round(iv[3] - c, 1))
+                        continue
                 if nid is not None:
                     self._flashed.add(nid)
                 self.flashes.append((ev[0], ev[2], ev[3], self.flash_side(m, ev[1])))
@@ -930,6 +1054,10 @@ class Session:
                 self.flashes = self.flashes[-50:]
         self._link_fstext(now)
         self._check_zero()
+        try:
+            self._diag_check(now)
+        except Exception:
+            pass
         # 오래된 즉시 기록 정리
         if self.instant:
             self.instant = {k: v for k, v in self.instant.items() if now - v[5] < 6000}
@@ -1014,24 +1142,47 @@ class Session:
     PLAY_GAP_MS = 3000.0
 
     def playing(self):
-        """곡을 치는 중인지: 마지막 노트 도달이 3초 안이면 치는 중 (그동안은 통계·추천·그래프 계산을 쉼)"""
-        if not self.arr_log:
+        """곡을 치는 중인지: 키와 짝지어진 마지막 노트가 3초 안이면 치는 중 (그동안은 무거운 추천 계산을 쉼).
+        노트 도달만으로 보면 결과 화면의 움직이는 그림을 노트로 잡아 '치는 중'이 계속되는 일이 있어서,
+        실제로 키를 눌러 짝지어진 기록으로 본다. 결과 화면을 읽은 뒤면 치는 중이 아님."""
+        m = self.active_mode()
+        mt = self.matchers.get(m) if m is not None else None
+        if mt is None or not mt.hits:
             return False
-        return time.perf_counter() * 1000.0 - self.arr_log[-1][0] < self.PLAY_GAP_MS
+        last = mt.hits[-1][0]
+        if getattr(self, "_last_result_t", -1e18) >= last:
+            return False
+        return time.perf_counter() * 1000.0 - last < self.PLAY_GAP_MS
+
+    def in_song(self, gap=15000.0):
+        """곡 중인지 (UI용): 결과 화면을 읽은 뒤 키와 짝지어진 기록이 있고, 마지막 기록이 15초 안.
+        곡 중간 쉬는 구간(몇 초)에서도 곡 중으로 봐서, 그래프·표·통계를 곡이 끝날 때(결과 화면)까지 안 그린다."""
+        m = self.active_mode()
+        mt = self.matchers.get(m) if m is not None else None
+        if mt is None or not mt.hits:
+            return False
+        last = mt.hits[-1][0]
+        if getattr(self, "_last_result_t", -1e18) >= last:
+            return False
+        return time.perf_counter() * 1000.0 - last < gap
 
     def stats(self):
         """0.5초마다 불림: 기록·설정이 그대로면 지난 계산을 그대로 씀 (메인 스레드 부하 줄이기)"""
         cfg = self.cfg
-        hits = [h for h in self.all_hits() if h[4] >= 1.0]
-        key = (len(hits), hits[-1][0] if hits else None, hits[-1][3] if hits else None,
+        # 바뀐 게 있는지는 기록 전체를 훑지 않고 개수·마지막 기록만으로 (0.5초마다 불리므로)
+        m = self.active_mode()
+        cur = self.matchers[m].hits if m is not None else []
+        mi = self.missed()
+        key = (len(self.past), len(cur), cur[-1][0] if cur else None, cur[-1][2] if cur else None,
+               self.past[-1][0] if self.past else None, self.seg_start,
                cfg.get("judge_setting_ms"), cfg.get("output_setting_ms"), cfg.get("window_ms"), cfg.get("calib_ms"),
-               self.fs_range(), cfg.get("recent"), cfg.get("measure"), self.active_mode(), len(self.missed()),
-               sum(self.missed().values()))
-        play = self.playing()
-        key = key + (play,)
+               self.fs_range(), cfg.get("recent"), cfg.get("measure"), m, len(mi), sum(mi.values()),
+               len(self.out_hist), self.playing())
         if getattr(self, "_stats_key", None) == key:
             return self._stats_val
         self._stats_key = key
+        play = key[-1]
+        hits = [h for h in self.all_hits() if h[4] >= 1.0]
         # 치는 중에는 무거운 추천 계산(판정 타이밍을 1ms씩 다 바꿔 보는 것)만 쉬고, 곡이 끝나면 다시 계산
         out = self._stats(hits, rec=not play)
         o = out["overall"]

@@ -148,6 +148,7 @@ def main():
 
     last_refresh = [0.0]
     rec_sent = [bool(cfg.get("record_save"))]
+    diag_sent = [bool(cfg.get("diag_8b"))]
 
     def poll():
         pressed = False
@@ -196,8 +197,10 @@ def main():
                         if rec.get("mission"):
                             mt = "  · 미션 곡(하드 판정)으로 저장" + ("" if cfg.get("game_mode") == "미션" else
                                                                " — 게임 모드를 [미션]으로 바꾸면 미션 곡들로 영점을 추천해요")
-                        app.set_status(msg="결과 화면 읽음: MAX 100%% %d · 100%% 아님 %d · BREAK %d  (분석기 범위 밖 %d)%s%s" % (
-                            rec["game"][0], rec["non100"], rec["brk"], ses.predicted_out(rec), zt, mt))
+                        kh = ses.key_hint()
+                        app.set_status(msg="결과 화면 읽음: MAX 100%% %d · 100%% 아님 %d · BREAK %d  (분석기 범위 밖 %d)%s%s%s" % (
+                            rec["game"][0], rec["non100"], rec["brk"], ses.predicted_out(rec), zt, mt,
+                            ("\n" + kh) if kh else ""))
                         app.on_song_end()
                     if len(m) > 3 and m[3] is not None and cfg.get("record_save"):
                         ses.save_record(m[3], m[2], cover=app.window_rect())
@@ -215,13 +218,13 @@ def main():
                             " — 게임 모드를 [래더]로 바꾸면 래더 곡들로 영점을 추천해요"
                         app.set_status(msg="래더 %d라운드 점수 읽음: %s점 (%s쪽, 분석기 예상 %s점)%s  · 래더 곡으로 저장%s" % (
                             rec["round"], format(rec["score"], ","), "왼" if rec.get("side") == "L" else "오른",
-                            format(ses.predicted_score(rec) or 0, ","), zt, gm))
+                            format(ses.predicted_score(rec) or 0, ","), zt, gm) + (
+                            ("\n" + ses.key_hint()) if ses.key_hint() else ""))
                         app.on_song_end()
                     if len(m) > 3 and m[3] is not None and cfg.get("record_save"):
                         ses.save_record(m[3], m[2], cover=app.window_rect(), ladder=m[1])
                 elif m[0] == "songend":
-                    ses.on_songend(m[1])
-                    app.on_song_end()
+                    ses.on_songend(m[1])          # 기록만 (곡 끝 처리는 결과 화면을 읽었을 때만)
                 elif m[0] == "songstart":
                     ses.log("songstart", round(m[1], 2))
                 elif m[0] == "vchg":
@@ -252,10 +255,17 @@ def main():
                 cmd_q.put(("recsave", rec_sent[0]))
             except Exception:
                 pass
+        if bool(cfg.get("diag_8b")) != diag_sent[0]:          # [8B 진단 저장]을 켜면 저장 가능 개수를 늘림
+            diag_sent[0] = bool(cfg.get("diag_8b"))
+            if diag_sent[0]:
+                try:
+                    cmd_q.put(("dumpmax", 40))
+                except Exception:
+                    pass
         if ses.dump_requests:
             for tq in ses.dump_requests:
                 try:
-                    cmd_q.put(("dump", tq))
+                    cmd_q.put(("dump",) + (tuple(tq) if isinstance(tq, tuple) else (tq,)))
                 except Exception:
                     pass
             ses.dump_requests = []

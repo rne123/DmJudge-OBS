@@ -369,6 +369,92 @@ def rescue_arrs(arrs, low, keys, hits, cfg, mode):
     return out, hits, n
 
 
+SIDE_COVER = {"L1": "TL", "L2": "TL", "L3": "TL", "L4": "TR", "L5": "TR", "L6": "TR"}
+
+
+def prune_side_fakes(arrs, keys, hits, cfg, mode):
+    """8B 전용, 곡이 끝난 뒤 채보 정리: 사이드(주황 반폭) 노트 때문에 생긴 가짜 노트를 빼고, 놓친 사이드 노트를 되살린다.
+    - 같은 레인 키를 0.12초 넘게 누르고 있는 동안 생긴 노트 = 누르고 있는 롱노트 몸통 → 뺌
+    - 사이드 키를 누르는(누르고 있는) 순간 그쪽 절반 레인에 생겼는데 그 레인 키는 안 누른 노트
+      = 사이드 노트를 레인 노트로 잘못 본 것 → 뺌. 그 시각에 사이드 노트가 안 잡혀 있으면 사이드 노트로 바꿔 넣음
+    (ez2pattern 실제 채보 대조: The Castle of Báthory 8B SC의 '없는데 만든 노트' 57개 중 47개가 이 경우)
+    반환: (arrs, hits, 뺀 수, 사이드로 바꾼 수)"""
+    if mode != "8B" or not arrs:
+        return arrs, hits, 0, 0
+    km = ((cfg or {}).get("modes", {}).get(mode, {}).get("keymap", {})) or {}
+    k2c = {}
+    for ch, ks in km.items():
+        for k in ([ks] if isinstance(ks, str) else ks):
+            k2c[str(k).upper()] = ch
+    downs, spans, cur = defaultdict(list), defaultdict(list), {}
+    for t, k, dn in sorted(keys):
+        ch = k2c.get(str(k).upper())
+        if not ch:
+            continue
+        if dn:
+            downs[ch].append(t)
+            cur.setdefault(ch, t)
+        elif ch in cur:
+            spans[ch].append((cur.pop(ch), t))
+    for ch, a in cur.items():
+        spans[ch].append((a, 1e18))
+    import bisect
+
+    def near(lst, t, w):
+        i = bisect.bisect_left(lst, t - w)
+        return i < len(lst) and lst[i] <= t + w
+
+    def held(ch, t, pre):
+        return any(a <= t - pre and b >= t for a, b in spans.get(ch, ()))
+
+    side_t = {c: sorted(t for t, ch, _ in arrs if ch == c) for c in ("TL", "TR")}
+    lane_t = defaultdict(list)
+    for t, ch, _ in arrs:
+        lane_t[ch].append(t)
+    for ch in lane_t:
+        lane_t[ch].sort()
+    ORDER = ["L1", "L2", "L3", "L4", "L5", "L6"]
+
+    def bleed(ch, t):
+        """양옆 레인(또는 한쪽 옆 레인 + 그쪽 사이드)에 같은 순간 노트가 있음 = 옆 노트 빛이 번져 보인 것일 수 있음"""
+        if ch not in ORDER:
+            return False
+        i = ORDER.index(ch)
+        nb = [ORDER[k] for k in (i - 1, i + 1) if 0 <= k < 6]
+        on = sum(1 for c in nb if near(lane_t.get(c, []), t, 8.0))
+        side_on = near(side_t.get(SIDE_COVER[ch], []), t, 8.0)
+        return on >= 2 or (on >= 1 and side_on)
+    hits = dict(hits)
+    out, n_drop, n_side = [], 0, 0
+    js_c = float((cfg or {}).get("judge_setting_ms", 0)) + float((cfg or {}).get("calib_ms", 0.0))
+    for t, ch, lg in arrs:
+        # 옆 노트가 번져 생긴 가짜: 양옆 레인(또는 옆 레인 + 그쪽 사이드)과 같은 순간인데 그 레인 키를 그 순간 안 누름
+        # (치는 사람은 보통 판정 기준 ±70ms 안에 누름. 빽빽한 곡에선 0.15초 안에 우연히 누른 키가 있어서 좁게 봄)
+        if bleed(ch, t) and not near(downs.get(ch, []), t - js_c, 70.0):
+            n_drop += 1
+            hits.pop((ch, round(t, 2)), None)
+            continue
+        if near(downs.get(ch, []), t, 150.0):
+            out.append((t, ch, lg))
+            continue
+        cv = SIDE_COVER.get(ch)
+        body = held(ch, t, 120.0)
+        side = cv is not None and (held(cv, t, 0.0) or near(downs.get(cv, []), t, 150.0))
+        if not (body or side):
+            out.append((t, ch, lg))
+            continue
+        n_drop += 1
+        hits.pop((ch, round(t, 2)), None)
+        if side and not body and near(downs.get(cv, []), t, 150.0) and not near(side_t[cv], t, 60.0):
+            d = min(downs[cv], key=lambda v: abs(v - t))
+            out.append((t, cv, False))
+            hits[(cv, round(t, 2))] = d - t
+            bisect.insort(side_t[cv], t)
+            n_side += 1
+    out.sort()
+    return out, hits, n_drop, n_side
+
+
 def _grid_fit(gaps, bpms, with_dev=False):
     """간격들이 이 BPM의 16분·24분·32분 격자에 얼마나 맞는지 (점수, 복잡도[, 평균 어긋남])"""
     tick = (60000.0 / bpms / 48.0)[:, None]        # 한 박 = 48칸 (16분=12, 24분=8, 32분=6)
@@ -2079,6 +2165,7 @@ def from_session(ses, start=None, end=None):
     arrs = [x for x in arrs if start - 1500 <= x[0] <= end + 500]
     low = [x for x in low if start - 1500 <= x[0] <= end + 500]
     arrs, hits, nres = rescue_arrs(arrs, low, keys, hits, ses.cfg, m)
+    arrs, hits, _, _ = prune_side_fakes(arrs, keys, hits, ses.cfg, m)
     js_c = float(ses.cfg.get("judge_setting_ms", 0)) + float(ses.cfg.get("calib_ms", 0.0))
     rep = analyze(arrs, hits, keys, vch, ses.cfg, m, js_c)
     if rep is not None:
@@ -2097,6 +2184,7 @@ def from_song(sg, cfg):
     hits = {(str(h[2]), round(h[0], 2)): h[3] for h in sg["hits"]}
     js_c = float(sg.get("js", 0.0)) + float(sg.get("calib", 0.0))
     arrs, hits, nres = rescue_arrs(arrs, sg.get("arrs_low") or [], sg.get("keys") or [], hits, cfg, sg["mode"])
+    arrs, hits, _, _ = prune_side_fakes(arrs, sg.get("keys") or [], hits, cfg, sg["mode"])
     rep = analyze(arrs, hits, sg.get("keys") or [], sg.get("vchg") or [], cfg, sg["mode"], js_c)
     if rep is not None:
         rep["game"] = sg.get("result")

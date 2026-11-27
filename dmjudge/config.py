@@ -67,6 +67,7 @@ DEFAULTS = {
     "capture_bias_ms": 0.0,      # 캡처 지연 보정(고급)
     "chatter_ms": 25,
     "recent": 0,                 # 0 = 전체, N = 최근 N개만
+    "diag_8b": False,            # [8B 진단 저장]: 사이드 노트 때문에 노트를 잘못 본 순간의 기어 화면을 dumps 폴더에 저장
     "record_save": False,        # [기록 저장]: 곡이 끝나면 결과 화면 PNG + 그 곡 _raw.csv를 자동 저장
     "record_dir": "",            # 비우면 프로그램 폴더의 '기록' 폴더
     "measure": "eye",            # eye(눈판정) / ear(귀판정)

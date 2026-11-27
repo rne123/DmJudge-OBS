@@ -398,6 +398,9 @@ class App(GraphDraw):
         from .edition import is_obs
         self.obs_edition = is_obs()
         self._restart_job = None
+        self._cfg_last = {}
+        self._graph_key = self._graph_ref = None
+        self._tree_ref = self._tree_win = None
         self.status = {"fps": 0.0, "speed": 0.0, "proc": 0.0, "skip": 0.0, "thr": False,
                        "keys": "대기", "msg": "", "lc": None}
         root.title("디맥 판정 분석기" + (" (OBS판)" if self.obs_edition else ""))
@@ -780,6 +783,12 @@ class App(GraphDraw):
                                command=self.on_focus_only, **ck), 4)
         self.var_top = tk.IntVar(value=1 if self.cfg["ui"].get("topmost", not self.obs_edition) else 0)
         fs3.add(tk.Checkbutton(fs3, text="분석기 창 항상 위", variable=self.var_top, command=self.on_topmost, **ck), 4)
+        df = tk.Frame(fs3, bg=BG)
+        self.var_diag = tk.IntVar(value=1 if self.cfg.get("diag_8b") else 0)
+        tk.Checkbutton(df, text="8B 진단 저장", variable=self.var_diag, command=self.on_diag, **ck).pack(side="left")
+        tk.Button(df, text="폴더", command=self.on_open_dumps, bg="#262a35", fg=FG, relief="flat",
+                  font=(FONT, 8)).pack(side="left", padx=2)
+        fs3.add(df, 4)
         gf = tk.Frame(fs3, bg=BG)
         self._lbl(gf, "기어 위치", 9).pack(side="left")
         self.var_gear = tk.StringVar(value=self.cfg.get("gear_pos") or "가운데")
@@ -878,6 +887,16 @@ class App(GraphDraw):
             pass
         self.cfg["measure"] = self.var_measure.get()
         self.cfg["recent"] = 0          # '최근 N개' 옵션은 없앰 (초기화로 끊어 쓰면 됨)
+        # 값은 바로 적용(인디케이터), 저장·다시그리기는 연달아 바꿀 때 한 번만
+        if getattr(self, "_set_job", None):
+            try:
+                self.root.after_cancel(self._set_job)
+            except Exception:
+                pass
+        self._set_job = self.root.after(150, self._settings_flush)
+
+    def _settings_flush(self):
+        self._set_job = None
         self.ctrl.save_cfg()
         self.refresh()
 
@@ -1022,6 +1041,24 @@ class App(GraphDraw):
             os.startfile(d)
         except Exception as e:
             messagebox.showerror("기록 폴더", "폴더를 열지 못했어요: %r" % (e,))
+
+    def on_diag(self):
+        """8B 진단 저장: 사이드(주황) 노트 때문에 노트를 잘못 본 것으로 보이는 순간의 기어 화면(앞 0.35초)을
+        앱 폴더의 dumps 안에 저장 (곡 하나에 최대 몇 장, 1.5초에 한 번). PC 안에만 저장하고 보내지 않음."""
+        self.cfg["diag_8b"] = bool(self.var_diag.get())
+        self.ctrl.save_cfg()
+        if self.cfg["diag_8b"]:
+            self.set_status(msg="8B 진단 저장 켬: 사이드 노트 관련 오인식 순간의 화면을 dumps 폴더에 저장해요 (최대 40개). "
+                                "8B 몇 판 친 뒤 [폴더]의 dump_*.npz 파일과 그 판 _raw.csv를 보내 주세요.")
+
+    def on_open_dumps(self):
+        import os
+        d = os.path.join(C.app_dir(), "dumps")
+        try:
+            os.makedirs(d, exist_ok=True)
+            os.startfile(d)
+        except Exception as e:
+            messagebox.showerror("진단 폴더", "폴더를 열지 못했어요: %r\n%s" % (e, d))
 
     def on_topmost(self):
         on = bool(self.var_top.get())
@@ -1240,6 +1277,14 @@ class App(GraphDraw):
     def set_status(self, **kw):
         self.status.update(kw)
 
+    def _cfg(self, w, **kw):
+        """글자·색이 바뀔 때만 다시 그리기 (0.5초마다 같은 글자를 다시 넣으면 창 배치를 매번 다시 계산해 버벅임)"""
+        last = self._cfg_last.get(id(w))
+        if last == kw:
+            return
+        self._cfg_last[id(w)] = kw
+        w.configure(**kw)
+
     def refresh(self):
         try:
             self._apply_zero_preset()      # 버튼 모드가 바뀌면 그 버튼의 영점으로 (인디케이터에 쓰이므로 치는 중에도)
@@ -1273,10 +1318,13 @@ class App(GraphDraw):
                         con = " · 연결됨" if self.obs.hub and self.obs.hub.clients > 0 else ""
                         t += "\nOBS 주소 %s · 브라우저 소스 크기 %d × %d (크기 100%% = 원래 인디케이터와 같음, OBS에서 늘리거나 줄이지 말고 '크기 %%'로)%s" % (
                             self.obs.url, w, h, con)
-                self.lbl_range.configure(text=t)
+                self._cfg(self.lbl_range, text=t)
         except Exception:
             pass
-        s = self.ses.stats()
+        # 곡 중(결과 화면 전)에는 통계·그래프·표를 계산하지도 그리지도 않음 (인디케이터 스터터링 방지).
+        # 상태줄과 '이번 곡 FAST/SLOW'(가벼움)만 갱신하고, 결과 화면을 읽으면 한 번에 그린다.
+        playing = self.ses.in_song()
+        s = {"mode": self.ses.active_mode(), "overall": {}} if playing else self.ses.stats()
         o = s["overall"]
         win = float(self.cfg.get("window_ms", 41.6))
         js = int(self.cfg.get("judge_setting_ms", 0))
@@ -1317,14 +1365,24 @@ class App(GraphDraw):
         how = ""
         if s["mode"] is not None and self.cfg.get("mode") == "auto" and self.ses.lanes_guess is None:
             how = "(키 입력으로 판별)"
-        self.lbl_status.configure(
+        self._cfg(self.lbl_status, 
             text="모드 %s%s · 캡처 %.0f fps · 노트 속도 %.2f px/ms%s · 키 입력 %s%s%s%s" % (
                 mode, how, st["fps"], st["speed"], vtxt, st["keys"], warn, diag,
                 ("\n" + st["msg"]) if st["msg"] else ""))
+        if playing:
+            sf = self.ses.song_fs()
+            if sf is not None:
+                t = "이번 곡  FAST %d  ·  SLOW %d    (±%.1f ms 밖, %d노트)" % (sf[0], sf[1], self.ses.fs_range(), sf[2])
+                sc = sf[3] if len(sf) > 3 else None
+                if sc:
+                    t += "    예상 %.2f%%" % sc["rate"]
+                self._cfg(self.lbl_fs, text=t)
+            self._cfg(self.lbl_rec, text="추천  이 곡   (곡이 끝나면 계산)\n추천  누적    (곡이 끝나면 계산)")
+            return
         if not o.get("n"):
-            self.lbl_line.configure(text="기록 없음 — 곡을 플레이하면 바로 표시돼요")
+            self._cfg(self.lbl_line, text="기록 없음 — 곡을 플레이하면 바로 표시돼요")
             for w in (self.lbl_spread, self.lbl_fs, self.lbl_in, self.lbl_rec, self.lbl_margin, self.lbl_sync):
-                w.configure(text="")
+                self._cfg(w, text="")
             self._draw_graph(None, win)
             self._fill_tree(s, win)
             return
@@ -1332,19 +1390,19 @@ class App(GraphDraw):
         # FAST/SLOW 개수는 곡마다 0부터 (다른 줄은 모을수록 정확해지는 값이라 [초기화] 전까지 누적)
         sf = self.ses.song_fs()
         if sf is None:
-            self.lbl_fs.configure(text="이번 곡  FAST 0  ·  SLOW 0    (±%.1f ms 밖)" % self.ses.fs_range())
+            self._cfg(self.lbl_fs, text="이번 곡  FAST 0  ·  SLOW 0    (±%.1f ms 밖)" % self.ses.fs_range())
         else:
             t = "이번 곡  FAST %d  ·  SLOW %d    (±%.1f ms 밖, %d노트)" % (sf[0], sf[1], self.ses.fs_range(), sf[2])
             sc = sf[3] if len(sf) > 3 else None
             if sc:
                 t += "    예상 %.2f%% (%s점)" % (sc["rate"], format(sc["score"], ","))
-            self.lbl_fs.configure(text=t)
+            self._cfg(self.lbl_fs, text=t)
         side = "빠름" if mj < 0 else "느림"
-        self.lbl_line.configure(
+        self._cfg(self.lbl_line, 
             text="나만의 판정선  %s ms  (%s)" % (fmt_ms(mj), side),
             fg=EARLY if mj < -2 else LATE if mj > 2 else FG)
-        self.lbl_spread.configure(text="흔들림  ±%.1f ms    (화면 기준 평균 %s ms)" % (o["robust_std"], fmt_ms(o["mean_e"])))
-        self.lbl_in.configure(text="[초기화] 뒤 모은 기록 전체  예상 %.2f%%    (%d노트)" % (o.get("rate_now", 0.0), o["n"]))
+        self._cfg(self.lbl_spread, text="흔들림  ±%.1f ms    (화면 기준 평균 %s ms)" % (o["robust_std"], fmt_ms(o["mean_e"])))
+        self._cfg(self.lbl_in, text="[초기화] 뒤 모은 기록 전체  예상 %.2f%%    (%d노트)" % (o.get("rate_now", 0.0), o["n"]))
         def rec_txt(oo):
             d_ = oo["best_setting"] - js
             if self.cfg.get("measure", "eye") == "eye":
@@ -1361,15 +1419,15 @@ class App(GraphDraw):
         else:
             l1 = "추천  이 곡   (곡이 끝나면 계산)"
         l2 = "추천  누적    " + rec_txt(o) + ("    (곡 끝나면 다시 계산)" if o.get("rec_stale") else "")
-        self.lbl_rec.configure(text=l1 + "\n" + l2)
-        self.lbl_margin.configure(text="추천값 적용 시 여유: 빠른 쪽 %.0f ms / 느린 쪽 %.0f ms%s" % (
+        self._cfg(self.lbl_rec, text=l1 + "\n" + l2)
+        self._cfg(self.lbl_margin, text="추천값 적용 시 여유: 빠른 쪽 %.0f ms / 느린 쪽 %.0f ms%s" % (
             o["margin_early"], o["margin_late"],
             "   ⚠ 흔들림이 커서 설정만으로는 다 못 넣어요" if o["robust_std"] > win / 2 else ""))
         cb = float(self.cfg.get("calib_ms", 0.0))
         zs = ("영점 보정 %+.1f ms" % cb) if cb else "영점 보정 없음"
         lat = self.ses.lat[-50:]
         ls = ("    · 입력→표시 %.1f ms" % (sorted(lat)[len(lat) // 2])) if lat else ""
-        self.lbl_sync.configure(text="귀판정 싱크: 지금 출력 = 판정 %s %d ms    · %s%s" % (
+        self._cfg(self.lbl_sync, text="귀판정 싱크: 지금 출력 = 판정 %s %d ms    · %s%s" % (
             "+" if out - js >= 0 else "−", abs(out - js), zs, ls))
         self._draw_graph(s["hist"], win)
         self._fill_tree(s, win)
@@ -1399,6 +1457,15 @@ class App(GraphDraw):
         g = self.graph_var.get()
         two = GRAPH_NAMES.index(g) >= 4 if g in GRAPH_NAMES else False
         self._set_all_view(two)
+        # 기록·설정·그래프 종류·창 크기가 그대로면 다시 그리지 않음 (통계는 바뀌면 새 dict라 hist도 새 것)
+        c = self.cfg
+        key = (g, id(hist), win, self.cv.winfo_width(), self.cv.winfo_height(), self.cv2.winfo_width(),
+               self.cv2.winfo_height(), c.get("judge_setting_ms"), c.get("calib_ms"), c.get("fs_ms"),
+               c.get("output_setting_ms"), c.get("measure"), len(self.ses.results), self.ses.song_end,
+               len(self.ses.past), self.ses.active_mode())
+        if key == self._graph_key and hist is self._graph_ref:
+            return
+        self._graph_key, self._graph_ref = key, hist
         try:
             self.cv.delete("all")
             self.cv2.delete("all")
@@ -1408,6 +1475,9 @@ class App(GraphDraw):
             self.lbl_graph.configure(text="그래프 오류: %r" % (e,))
 
     def _fill_tree(self, s, win):
+        if s is self._tree_ref and win == self._tree_win:
+            return                        # 통계가 그대로면 표를 다시 채우지 않음
+        self._tree_ref, self._tree_win = s, win
         t = self.tree
         t.delete(*t.get_children())
         def row(name, o, etc=""):
