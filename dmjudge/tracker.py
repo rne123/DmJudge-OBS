@@ -76,6 +76,28 @@ class NoteTracker:
             cols = np.where(m)[0]
             lane_cols = [np.where(m & (self.lane_of == l))[0] for l in range(lanes)]
             self._half_cols.append((cols, [lc for lc in lane_cols if len(lc)]))
+        # 6레인(6B·8B): 반쪽 안 레인별 (전체 샘플, 안쪽 샘플, 노트로 볼 최소 개수)
+        # → 반폭 노트 위에 일반 노트가 겹쳐 반폭 노트 색이 한 레인에만 보일 때도 반폭 노트로 보기 위해
+        # (위치는 모두 그 반쪽 샘플 열 cols 안에서의 번호)
+        self._half_lanes = []
+        for h in (0, 1):
+            hl = None
+            cols = self._half_cols[h][0]
+            ls = []
+            if lanes >= 6:
+                for l in range(lanes):
+                    pos = np.where(self.lane_of[cols] == l)[0]
+                    if len(pos) == len(self._lane_cols[l]) and len(pos) >= 4:
+                        ipos = pos[self.inner[cols][pos]]
+                        ls.append((pos, ipos))
+            if ls:
+                st = np.array([p_[0] for p_, _ in ls])
+                ln = np.array([len(p_) for p_, _ in ls])
+                ip = np.concatenate([i_ for _, i_ in ls])
+                ist = np.cumsum([0] + [len(i_) for _, i_ in ls])[:-1]
+                need = np.array([max(1, int(np.ceil(len(i_) * self.c["lane_frac"]))) for _, i_ in ls])
+                hl = dict(st=st, en=st + ln - 1, ln=ln, ip=ip, ist=ist, need=need, n=len(cols))
+            self._half_lanes.append(hl)
         # 인디케이터 등으로 가려지는 줄 (캡처 영역 기준 y 범위) → 추적 구간에서 '가려짐'으로 처리
         self.band = None
         if self.g.get("mask"):
@@ -131,6 +153,21 @@ class NoteTracker:
 
         bright = rng(0, 255, 0)
         trig = rng(c["trig_h"][0], c["trig_h"][1], smin)
+        haze_box = []
+
+        def get_haze():
+            # 6레인: 트리거(주황) 롱노트 몸통 위에 키 빔(빛)이 겹쳐 노랑~연두로 보이는 부분 (일반 노트보다 어두움)
+            # 필요할 때(반쪽에 트리거 몸통이 있을 때)만 한 번 계산
+            if not haze_box:
+                lo = np.array([max(0, int(c["trig_h"][0])), 60, vmin], np.uint8)
+                hi = np.array([50, 255, 225], np.uint8)        # 노랑 롱노트 몸통(밝기 234~)·노트(255)는 빼고
+                hz_ = cv2.inRange(hsv, lo, hi)
+                np.bitwise_and(hz_, 1, out=hz_)
+                hz_ = hz_.view(bool)
+                if self.band is not None:
+                    hz_[self.band[0]:self.band[1]] = False
+                haze_box.append(hz_)
+            return haze_box[0]
         side = rng(c["side_h"][0], c["side_h"][1], smin)
         if self.band is not None:
             bright[self.band[0]:self.band[1]] = False
@@ -155,11 +192,86 @@ class NoteTracker:
                 for lc in lane_cols:
                     nl_on += mask[:, lc].any(1)
                 ok = (frac >= 0.55) | ((frac >= c["wide_frac"]) & (nl_on >= 2))
+                hl = self._half_lanes[h]
+                hz = None
+                if hl:
+                    # 반폭 노트 위에 일반 노트가 겹친 줄: 반폭 노트 색이 레인 하나를 가장자리까지 꽉 채우고
+                    # (일반 노트는 레인보다 좁음) 나머지 레인은 그 색이 아닌 노트로 덮여 있으면 반폭 노트
+                    # (예: 8B 사이드 노트 L4~L6 + L5·L6 노트 → L4에 보이는 주황을 L4 노트로 잘못 보던 것)
+                    # 반폭 노트 조각: 레인 대부분이 그 색이고, 레인 끝이 반쪽 화면 끝이거나
+                    # 옆 레인의 같은 색과 이어짐 (일반 노트는 레인보다 좁아 양옆과 안 이어짐)
+                    # (끝 샘플 하나는 옆 노트 그림자·선 때문에 비어 있을 수 있어 두 개까지 봄)
+                    su8 = sub.view(np.uint8)
+                    lsum = np.add.reduceat(su8, hl["st"], axis=1, dtype=np.int16)
+                    fr_ = (lsum >= 0.75 * hl["ln"]) & ~ok[:, None]     # 이미 반폭 노트인 줄은 볼 필요 없음
+                    full = None
+                    if fr_.any():
+                        n_ = hl["n"]
+                        fl = np.zeros_like(fr_)
+                        for j, (p0, p1) in enumerate(zip(hl["st"], hl["en"])):
+                            if not fr_[:, j].any():
+                                continue
+                            e0 = sub[:, p0] | sub[:, p0 + 1]
+                            if p0 > 0:
+                                e0 = e0 & (sub[:, p0 - 1] | sub[:, max(0, p0 - 2)])
+                            e1 = sub[:, p1] | sub[:, p1 - 1]
+                            if p1 < n_ - 1:
+                                e1 = e1 & (sub[:, p1 + 1] | sub[:, min(n_ - 1, p1 + 2)])
+                            fl[:, j] = fr_[:, j] & (e0 | e1)
+                        full = fl
+                    cov_box = []
+
+                    def get_cov():
+                        # 반쪽의 모든 레인이 '반폭 노트 조각' 또는 '그 색이 아닌 노트'로 덮였는지
+                        if not cov_box:
+                            bs = bright[:, cols].take(hl["ip"], axis=1) & ~sub.take(hl["ip"], axis=1)
+                            bsum = np.add.reduceat(bs.view(np.uint8), hl["ist"], axis=1, dtype=np.int16)
+                            busy = bsum >= hl["need"]
+                            if full is not None:
+                                busy |= full
+                            cov_box.append(busy.all(1))
+                        return cov_box[0]
+                    if full is not None and full.any():
+                        ok |= full.any(1) & get_cov()
+                    hz = None
+                    if mask is trig and ok.any():
+                        # 몸통에 키 빔이 겹친 줄: 주황+빔 색이 반쪽 대부분이고 위아래로 몸통과 이어져 있으면 몸통
+                        haze = get_haze()
+                        hsub = haze[:, cols] | sub
+                        wr = hsub.sum(1) >= 0.55 * n
+                        d0 = np.diff(np.concatenate([[0], wr.astype(np.int8), [0]]))
+                        st_, en_ = np.where(d0 == 1)[0], np.where(d0 == -1)[0]
+                        gw = max(3, int(0.15 * self.lw))          # 콤보 글자 등으로 생긴 짧은 틈은 메움
+                        for a_, b_ in zip(en_[:-1], st_[1:]):
+                            if b_ - a_ <= gw:
+                                wr[a_:b_] = True
+                        d0 = np.diff(np.concatenate([[0], wr.astype(np.int8), [0]]))
+                        st_, en_ = np.where(d0 == 1)[0], np.where(d0 == -1)[0]
+                        ext = np.zeros(rows, bool)
+                        for a_, b_ in zip(st_, en_):
+                            # 빔은 판정선 쪽(아래)에서 올라옴: 몸통에서 아래로 이어지는 부분만
+                            k = np.where(ok[max(0, a_ - 1):b_])[0]
+                            if len(k):
+                                ext[max(0, a_ - 1) + k[0]:b_] = True
+                        ext &= ~ok
+                        if ext.any():
+                            hz = (ext, haze[:, cols])
+                            ok |= ext
+                    # 반폭 롱노트 몸통 위를 일반 노트가 반쪽 전체를 덮고 지나가는 줄: 몸통이 끊긴 것으로 보지 않음
+                    if ok.any():
+                        d0 = np.diff(np.concatenate([[0], ok.astype(np.int8), [0]]))
+                        st_, en_ = np.where(d0 == 1)[0], np.where(d0 == -1)[0]
+                        gmax = 0.6 * self.lw
+                        for a_, b_ in zip(en_[:-1], st_[1:]):
+                            if b_ - a_ <= gmax and get_cov()[a_:b_].all():
+                                ok[a_:b_] = True
                 out += self._runs(ok.copy(), name, rows, top)
                 if ok.any():
                     if excl is None:
                         excl = np.zeros_like(bright)
                     excl[:, cols] |= sub & ok[:, None]
+                    if hl and hz is not None:
+                        excl[:, cols] |= hz[1] & hz[0][:, None]
         # 일반 레인: 색과 상관없이 밝은 노트 (반폭 노트로 판정된 줄의 그 색 픽셀만 제외)
         note = bright if excl is None else (bright & ~excl)
         sums = np.add.reduceat(note[:, self._inner_cols].astype(np.int16), self._lane_starts, axis=1)
